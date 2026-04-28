@@ -33,6 +33,9 @@ defmodule FireBird.Client do
   @doc "Checks if the Phoenixd node is reachable and healthy."
   @callback health_check(config()) :: :ok | {:error, term()}
 
+  @doc "Fetches an outgoing payment by its UUID."
+  @callback get_outgoing_payment(config(), String.t()) :: {:ok, map()} | {:error, term()}
+
   @doc "Sends funds on-chain via splice-out. Returns the transaction ID."
   @callback send_onchain(config(), String.t(), pos_integer(), pos_integer()) ::
               {:ok, String.t()} | {:error, term()}

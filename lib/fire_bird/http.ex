@@ -83,6 +83,11 @@ defmodule FireBird.HTTP do
   end
 
   @impl FireBird.Client
+  def get_outgoing_payment(%__MODULE__{} = config, payment_id) when is_binary(payment_id) do
+    get(config, "/payments/outgoing/#{payment_id}")
+  end
+
+  @impl FireBird.Client
   def get_info(%__MODULE__{} = config) do
     get(config, "/getinfo")
   end

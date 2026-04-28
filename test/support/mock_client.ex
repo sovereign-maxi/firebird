@@ -65,6 +65,12 @@ defmodule FireBird.MockClient do
   end
 
   @impl FireBird.Client
+  def get_outgoing_payment(agent, payment_id) do
+    record_call(agent, :get_outgoing_payment, {payment_id})
+    get_response(agent, :get_outgoing_payment)
+  end
+
+  @impl FireBird.Client
   def health_check(agent) do
     record_call(agent, :health_check, {})
     get_response(agent, :health_check)
