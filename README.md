@@ -55,7 +55,7 @@ end
 | `FireBird.Payment` | Payment state machine with exponential backoff retry |
 | `FireBird.Events` | 8 event structs for invoice, payment, and liquidity lifecycle |
 | `FireBird.Client` | Behaviour contract for Phoenixd API operations |
-| `FireBird.WAL` | Optional write-ahead log behaviour (1 callback) |
+| `FireBird.WAL` | Optional write-ahead log behaviour (append + recover) |
 | `FireBird.Bolt11` | Pure BOLT11 invoice amount parser |
 | `FireBird.Fees` | Fee calculation with PPM, floor, and ceiling clamping |
 | `FireBird.PubSub` | Registry-based event publish/subscribe |
@@ -228,7 +228,7 @@ forward "/webhooks/lightning", FireBird.Webhook,
   invoice_manager: FireBird.Manager
 ```
 
-Features HMAC-SHA256 signature verification, replay protection, and event deduplication.
+Features HMAC-SHA256 signature verification, replay protection, event deduplication, and per-IP rate limiting.
 
 ## Events
 
@@ -272,7 +272,12 @@ defmodule MyApp.MockClient do
   def pay_invoice(config, bolt11, amount_sats, description), do: ...
   def get_balance(config), do: ...
   def get_incoming_payment(config, payment_hash), do: ...
+  def get_outgoing_payment(config, payment_id), do: ...
+  def get_info(config), do: ...
   def health_check(config), do: ...
+
+  # Optional
+  def send_onchain(config, address, amount_sats, fee_rate_sat_per_vbyte), do: ...
 end
 ```
 
@@ -285,7 +290,10 @@ defmodule MyApp.PaymentWAL do
   @behaviour FireBird.WAL
 
   @impl FireBird.WAL
-  def append(payment), do: ...
+  def append(config, entry), do: ...
+
+  @impl FireBird.WAL
+  def recover(config), do: {:ok, [...]}
 end
 ```
 
@@ -293,11 +301,11 @@ Pass to supervisor: `wal: MyApp.PaymentWAL`
 
 ## Architecture
 
-- **Config via opts** — zero `Application.get_env` calls, all configuration injected
-- **Client as `{module, config}` tuple** — stored in GenServer state, enables multiple connections
-- **ETS module-named tables** — `FireBird.Manager`, `FireBird.Executor`, `FireBird.Monitor`, `FireBird.Webhook`
-- **Registry PubSub** — uses Elixir `Registry` (not Phoenix.PubSub) for event delivery
-- **WAL optional** — single-callback behaviour, PaymentExecutor persists in-flight payments on terminate
+- **Config via opts**: zero `Application.get_env` calls, all configuration injected
+- **Client as `{module, config}` tuple**: stored in GenServer state, enables multiple connections
+- **ETS module-named tables**: `FireBird.Manager`, `FireBird.Executor`, `FireBird.Monitor`, `FireBird.Webhook`
+- **Registry PubSub**: uses Elixir `Registry` (not Phoenix.PubSub) for event delivery
+- **WAL optional**: two-callback behaviour, `Executor` appends on terminate and recovers on init
 
 ## Development
 
@@ -331,7 +339,8 @@ defp deps do
   [
     {:jason, "~> 1.4"},
     {:finch, "~> 0.19"},
-    {:plug, "~> 1.16"}
+    {:plug, "~> 1.16"},
+    {:telemetry, "~> 1.3"}
   ]
 end
 ```
