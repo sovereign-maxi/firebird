@@ -88,7 +88,7 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => preimage_hex}}
+        {:ok, %{"isPaid" => true, "preimage" => preimage_hex, "receivedSat" => 1_000}}
       )
 
       send(ctx.pid, :poll)
@@ -156,7 +156,7 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => false, "preimage" => preimage_hex}}
+        {:ok, %{"isPaid" => false, "preimage" => preimage_hex, "receivedSat" => 1_000}}
       )
 
       send(ctx.pid, :poll)
@@ -181,7 +181,7 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"preimage" => preimage_hex}}
+        {:ok, %{"preimage" => preimage_hex, "receivedSat" => 1_000}}
       )
 
       send(ctx.pid, :poll)
@@ -206,7 +206,7 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => preimage_hex}}
+        {:ok, %{"isPaid" => true, "preimage" => preimage_hex, "receivedSat" => 1_000}}
       )
 
       send(ctx.pid, :poll)
@@ -233,7 +233,7 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => wrong_hex}}
+        {:ok, %{"isPaid" => true, "preimage" => wrong_hex, "receivedSat" => 1_000}}
       )
 
       send(ctx.pid, :poll)
@@ -338,7 +338,11 @@ defmodule FireBird.ManagerTest do
                       %FireBird.Events.InvoicePaid{payment_hash: ^payment_hash}}
     end
 
-    test "missing receivedSat field still confirms (backwards compat)", ctx do
+    test "missing receivedSat field fails closed (no auto-confirm)", ctx do
+      # Security-relevant: crediting the invoice at the EXPECTED amount
+      # when phoenixd doesn't tell us what actually landed is a free-mint
+      # vector under any scenario where phoenixd is compromised or the
+      # API changes shape. We refuse to confirm.
       preimage = :crypto.strong_rand_bytes(32)
       payment_hash = :crypto.hash(:sha256, preimage)
       preimage_hex = Base.encode16(preimage, case: :lower)
@@ -350,14 +354,15 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => preimage_hex}}
+        {:ok, %{"isPaid" => true, "preimage" => preimage_hex, "receivedSat" => 1_000}}
       )
 
       send(ctx.pid, :poll)
       :sys.get_state(ctx.pid)
 
-      assert_receive {FireBird.PubSub, :invoice,
-                      %FireBird.Events.InvoicePaid{payment_hash: ^payment_hash}}
+      refute_receive {FireBird.PubSub, :invoice, %FireBird.Events.InvoicePaid{}}
+      assert {:ok, unchanged} = Manager.lookup(ctx.table, payment_hash)
+      assert unchanged.status == :pending
     end
   end
 
@@ -375,7 +380,7 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => short_hex}}
+        {:ok, %{"isPaid" => true, "preimage" => short_hex, "receivedSat" => 1_000}}
       )
 
       send(ctx.pid, :poll)
@@ -400,7 +405,7 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => preimage_hex}}
+        {:ok, %{"isPaid" => true, "preimage" => preimage_hex, "receivedSat" => 1_000}}
       )
 
       Manager.check_payment(ctx.pid, payment_hash)
@@ -512,7 +517,12 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         client_name,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => Base.encode16(preimage, case: :lower)}}
+        {:ok,
+         %{
+           "isPaid" => true,
+           "preimage" => Base.encode16(preimage, case: :lower),
+           "receivedSat" => 1_000
+         }}
       )
 
       send(pid, :poll)
@@ -561,7 +571,12 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         client_name,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => Base.encode16(preimage, case: :lower)}}
+        {:ok,
+         %{
+           "isPaid" => true,
+           "preimage" => Base.encode16(preimage, case: :lower),
+           "receivedSat" => 1_000
+         }}
       )
 
       send(pid, :poll)

@@ -235,7 +235,7 @@ defmodule FireBird.WebhookTest do
       FireBird.MockClient.set_response(
         client_name,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => preimage_hex}}
+        {:ok, %{"isPaid" => true, "preimage" => preimage_hex, "receivedSat" => 1_000}}
       )
 
       Registry.register(pubsub, :invoice, [])

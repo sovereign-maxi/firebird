@@ -196,7 +196,7 @@ defmodule FireBird.Manager do
   defp validate_received_and_confirm(state, invoice, preimage_hex, resp) do
     case parse_received_sats(resp) do
       {:ok, received} when received >= invoice.amount_sats ->
-        confirm_payment(state, invoice, preimage_hex)
+        confirm_payment(state, invoice, preimage_hex, received)
 
       {:ok, received} ->
         Logger.warning(
@@ -206,8 +206,18 @@ defmodule FireBird.Manager do
         )
 
       :unknown ->
-        # receivedSat not present — confirm anyway (backwards compat)
-        confirm_payment(state, invoice, preimage_hex)
+        # `receivedSat` absent from phoenixd response. Fail closed —
+        # crediting the invoice at the expected amount without proof
+        # that the expected amount landed is a free-mint vector under
+        # any scenario where phoenixd is compromised, proxied, or its
+        # API changes shape. If phoenixd genuinely stops emitting the
+        # field on some future version, refuse to confirm and let the
+        # operator investigate — do NOT auto-credit.
+        Logger.error(
+          "Manager: phoenixd response missing receivedSat for " <>
+            "#{Base.encode16(invoice.payment_hash, case: :lower)} — " <>
+            "refusing to confirm (fail-closed)"
+        )
     end
   end
 
@@ -220,22 +230,28 @@ defmodule FireBird.Manager do
 
   defp parse_received_sats(_resp), do: :unknown
 
-  defp confirm_payment(state, invoice, preimage_hex) do
+  defp confirm_payment(state, invoice, preimage_hex, received_sats) do
     with {:ok, preimage} <- Base.decode16(preimage_hex, case: :mixed),
          :ok <- validate_preimage_length(preimage),
          {:ok, paid_invoice} <- Invoice.mark_paid(invoice, preimage) do
       :ets.insert(state.table_name, {invoice.payment_hash, paid_invoice})
 
+      # Publish both `received_sats` (what actually landed on LN) and
+      # `amount_sats` (what the invoice asked for). Consumers can
+      # enforce `received >= expected` at the app boundary — a second
+      # line of defense against a compromised phoenixd or a proxy that
+      # silently downgrades the response.
       PubSub.publish(state.pubsub, :invoice, %InvoicePaid{
         payment_hash: invoice.payment_hash,
         amount_sats: invoice.amount_sats,
+        received_sats: received_sats,
         paid_at: paid_invoice.paid_at
       })
 
       :telemetry.execute(
         [:fire_bird, :invoice, :settled],
         %{count: 1},
-        %{amount_sats: invoice.amount_sats}
+        %{amount_sats: invoice.amount_sats, received_sats: received_sats}
       )
     else
       error ->

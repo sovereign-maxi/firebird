@@ -21,6 +21,7 @@ defmodule FireBird.EventsTest do
       event = %InvoicePaid{
         payment_hash: <<0::256>>,
         amount_sats: 1000,
+        received_sats: 1000,
         paid_at: DateTime.utc_now()
       }
 

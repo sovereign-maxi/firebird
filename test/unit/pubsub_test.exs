@@ -17,6 +17,7 @@ defmodule FireBird.PubSubTest do
       event = %InvoicePaid{
         payment_hash: <<0::256>>,
         amount_sats: 1000,
+        received_sats: 1000,
         paid_at: DateTime.utc_now()
       }
 
@@ -31,6 +32,7 @@ defmodule FireBird.PubSubTest do
       event = %InvoicePaid{
         payment_hash: <<0::256>>,
         amount_sats: 1000,
+        received_sats: 1000,
         paid_at: DateTime.utc_now()
       }
 
@@ -75,6 +77,7 @@ defmodule FireBird.PubSubTest do
       assert PubSub.topic_for_event(%InvoicePaid{
                payment_hash: <<>>,
                amount_sats: 0,
+               received_sats: 0,
                paid_at: DateTime.utc_now()
              }) == :invoice
     end

@@ -12,14 +12,24 @@ defmodule FireBird.Events do
   """
 
   defmodule InvoicePaid do
-    @moduledoc "Emitted when an invoice is confirmed paid with a valid preimage."
+    @moduledoc """
+    Emitted when an invoice is confirmed paid with a valid preimage.
 
-    @enforce_keys [:payment_hash, :amount_sats, :paid_at]
-    defstruct [:payment_hash, :amount_sats, :paid_at, version: 1]
+    `amount_sats` is the value the invoice was minted for (i.e. what
+    the mint expected). `received_sats` is what phoenixd reported as
+    actually landed on the Lightning side. Consumers should assert
+    `received_sats >= amount_sats` at the app boundary — a second
+    line of defense against a compromised phoenixd or downgraded
+    proxy layer.
+    """
+
+    @enforce_keys [:payment_hash, :amount_sats, :received_sats, :paid_at]
+    defstruct [:payment_hash, :amount_sats, :received_sats, :paid_at, version: 1]
 
     @type t :: %__MODULE__{
             payment_hash: binary(),
             amount_sats: pos_integer(),
+            received_sats: pos_integer(),
             paid_at: DateTime.t(),
             version: pos_integer()
           }
