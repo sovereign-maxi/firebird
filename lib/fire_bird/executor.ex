@@ -260,8 +260,8 @@ defmodule FireBird.Executor do
 
         if count > 0 do
           Logger.warning(
-            "Executor: recovering #{count} in-flight payments from WAL — " <>
-              "marking each :unknown; caller must reconcile before releasing"
+            "Executor: recovering in-flight payments from WAL, " <>
+              "marking each :unknown, caller must reconcile before releasing, count=#{count}"
           )
         end
 
@@ -531,9 +531,9 @@ defmodule FireBird.Executor do
         })
 
         Logger.error(
-          "Executor: payment outcome UNKNOWN for " <>
-            Base.encode16(payment.payment_hash, case: :lower) <>
-            " — MUST reconcile before releasing (reason=#{reason_str})"
+          "Executor: payment outcome unknown, caller must reconcile before releasing, " <>
+            "payment_hash=#{Base.encode16(payment.payment_hash, case: :lower)}, " <>
+            "reason=#{reason_str}"
         )
 
         :telemetry.execute(
