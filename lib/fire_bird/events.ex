@@ -104,6 +104,34 @@ defmodule FireBird.Events do
           }
   end
 
+  defmodule PaymentUnknown do
+    @moduledoc """
+    Emitted when a payment's Lightning outcome is undetermined —
+    HTTP timeout, transport error, task crash, or ambiguous 5xx from
+    the node. The payment MAY still settle. Consumers MUST NOT
+    release the caller's reservation on this event; instead they
+    should transition their local state to a fail-closed "settlement
+    unknown" and reconcile with the node before any further action.
+
+    `phoenixd_id` is included when we captured it before the
+    ambiguous event (e.g. we processed the /payinvoice response but
+    then crashed on the follow-up bookkeeping). Nil when we never
+    got a response back.
+    """
+
+    @enforce_keys [:payment_hash, :amount_sats, :reason, :attempt]
+    defstruct [:payment_hash, :amount_sats, :reason, :attempt, :phoenixd_id, version: 1]
+
+    @type t :: %__MODULE__{
+            payment_hash: binary(),
+            amount_sats: pos_integer(),
+            reason: String.t(),
+            attempt: pos_integer(),
+            phoenixd_id: String.t() | nil,
+            version: pos_integer()
+          }
+  end
+
   defmodule LiquidityLow do
     @moduledoc "Emitted when balance drops below the low watermark."
 

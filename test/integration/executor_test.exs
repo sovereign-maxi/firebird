@@ -146,12 +146,15 @@ defmodule FireBird.ExecutorTest do
     end
   end
 
-  describe "failure and retry" do
+  describe "failure and retry (retryable errors)" do
     test "publishes PaymentFailed, then retry leads to success", ctx do
       Registry.register(ctx.pubsub, :payment, [])
       payment = build_test_payment(max_attempts: 3)
 
-      # First attempt fails
+      # First attempt returns a structured phoenixd error that classifies
+      # as :retryable (temporary route/liquidity problem — the payment
+      # provably did NOT happen, retrying may succeed). Second attempt
+      # succeeds.
       preimage = :crypto.strong_rand_bytes(32)
       preimage_hex = Base.encode16(preimage, case: :lower)
 
@@ -162,7 +165,7 @@ defmodule FireBird.ExecutorTest do
         :counters.add(call_count, 1, 1)
 
         if count == 0 do
-          {:error, :route_not_found}
+          {:error, {:phoenixd_error, :route_not_found, "no route"}}
         else
           {:ok, %{"preimage" => preimage_hex, "fees" => 2}}
         end
@@ -178,7 +181,11 @@ defmodule FireBird.ExecutorTest do
       Registry.register(ctx.pubsub, :payment, [])
       payment = build_test_payment(max_attempts: 1)
 
-      MockClient.set_response(ctx.client, :pay_invoice, {:error, :route_not_found})
+      MockClient.set_response(
+        ctx.client,
+        :pay_invoice,
+        {:error, {:phoenixd_error, :route_not_found, "no route"}}
+      )
 
       Executor.submit(ctx.pid, payment)
 
@@ -187,6 +194,92 @@ defmodule FireBird.ExecutorTest do
                         attempts: 1
                       }},
                      1_000
+    end
+  end
+
+  describe "unknown-outcome errors (fail-closed)" do
+    test "HTTP timeout publishes PaymentUnknown, NOT PaymentFailed/Exhausted", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(ctx.client, :pay_invoice, {:error, :timeout})
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 200
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 200
+    end
+
+    test "5xx server error publishes PaymentUnknown", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(ctx.client, :pay_invoice, {:error, {:http_error, 502, "Bad Gateway"}})
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+    end
+
+    test "4xx client error publishes PaymentExhausted (definitive failure)", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(ctx.client, :pay_invoice, {:error, {:http_error, 400, "Bad Request"}})
+
+      Executor.submit(ctx.pid, payment)
+
+      # Definitive-failure release path — one Exhausted event, no
+      # Failed/retry ladder.
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 200
+    end
+  end
+
+  describe "submit-side idempotency" do
+    test "rejects duplicate submit while an earlier one is in-flight", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment()
+
+      # Slow response so the first submit stays in-flight long enough
+      # for the duplicate check to fire.
+      me = self()
+
+      MockClient.set_response(ctx.client, :pay_invoice, fn ->
+        send(me, :first_call_started)
+        Process.sleep(200)
+
+        {:ok,
+         %{"preimage" => Base.encode16(:crypto.strong_rand_bytes(32), case: :lower), "fees" => 1}}
+      end)
+
+      assert :ok = Executor.submit(ctx.pid, payment)
+      assert_receive :first_call_started, 500
+
+      # Second submit with the SAME payment_hash while the first is
+      # still executing must be rejected — otherwise we'd fire a
+      # second /payinvoice against the same invoice.
+      assert {:error, {:duplicate, {:in_flight, _status}}} =
+               Executor.submit(ctx.pid, payment)
+
+      # Let the first one finish.
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentSent{}}, 2_000
+    end
+
+    test "rejects submit for a payment left in :unknown state", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment()
+
+      MockClient.set_response(ctx.client, :pay_invoice, {:error, :timeout})
+      assert :ok = Executor.submit(ctx.pid, payment)
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+
+      # An unknown-outcome payment may still settle on Lightning.
+      # A resubmit for the same hash must be rejected until the
+      # operator reconciles.
+      assert {:error, {:duplicate, {:already_terminal, :unknown}}} =
+               Executor.submit(ctx.pid, payment)
     end
   end
 

@@ -20,7 +20,7 @@ defmodule FireBird.Executor do
 
   use GenServer
 
-  alias FireBird.Events.{PaymentExhausted, PaymentFailed, PaymentSent}
+  alias FireBird.Events.{PaymentExhausted, PaymentFailed, PaymentSent, PaymentUnknown}
   alias FireBird.Payment
   alias FireBird.PubSub
   alias FireBird.Util
@@ -45,6 +45,18 @@ defmodule FireBird.Executor do
   @default_max_concurrent 10
   @default_retention_ms 86_400_000
   @default_cleanup_interval 3_600_000
+
+  # Non-terminal statuses in which a duplicate submit is rejected —
+  # accepting one would spawn a second `pay_invoice` task for the
+  # same invoice, and phoenixd's `/payinvoice` carries no idempotency
+  # key, so the invoice could pay TWICE.
+  @in_flight_statuses [:pending, :in_flight, :retrying]
+
+  # Terminal statuses in which a duplicate submit is likewise
+  # rejected: `:succeeded` because the invoice already paid,
+  # `:unknown` because it MIGHT have paid and the caller must
+  # reconcile before firing again.
+  @locked_terminal_statuses [:succeeded, :unknown]
 
   @doc "Starts the payment executor."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -118,11 +130,36 @@ defmodule FireBird.Executor do
 
   @impl GenServer
   def handle_call({:submit, payment}, _from, state) do
-    if map_size(state.tasks) >= state.max_concurrent do
-      {:reply, {:error, :at_capacity}, state}
-    else
-      state = execute_payment(state, payment)
-      {:reply, :ok, state}
+    cond do
+      map_size(state.tasks) >= state.max_concurrent ->
+        {:reply, {:error, :at_capacity}, state}
+
+      duplicate_reason = duplicate_submit_reason(state.table_name, payment.payment_hash) ->
+        {:reply, {:error, {:duplicate, duplicate_reason}}, state}
+
+      true ->
+        state = execute_payment(state, payment)
+        {:reply, :ok, state}
+    end
+  end
+
+  # Refuses a repeat `submit` for a payment_hash the executor is
+  # already tracking in a non-releasable state — this is the
+  # per-invoice idempotency gate, distinct from the WAL's crash-
+  # recovery replay path. Returns nil (fresh submit allowed) or the
+  # atom describing the existing state.
+  defp duplicate_submit_reason(table_name, payment_hash) do
+    case :ets.lookup(table_name, payment_hash) do
+      [{^payment_hash, %Payment{status: status}}]
+      when status in @in_flight_statuses ->
+        {:in_flight, status}
+
+      [{^payment_hash, %Payment{status: status}}]
+      when status in @locked_terminal_statuses ->
+        {:already_terminal, status}
+
+      _other ->
+        nil
     end
   end
 
@@ -300,9 +337,10 @@ defmodule FireBird.Executor do
   defp process_result(state, payment, {:ok, resp}) when is_map(resp) do
     preimage_hex = resp["paymentPreimage"] || resp["preimage"]
     fee_raw = resp["routingFeeSat"] || resp["fees"]
+    phoenixd_id = resp["paymentId"]
 
     if is_binary(preimage_hex) and preimage_hex != "" do
-      process_preimage(state, payment, preimage_hex, fee_raw)
+      process_preimage(state, payment, preimage_hex, fee_raw, phoenixd_id)
     else
       Logger.warning(
         "Executor: success response missing preimage for " <>
@@ -315,6 +353,69 @@ defmodule FireBird.Executor do
   end
 
   defp process_result(state, payment, {:error, reason}) do
+    case classify_error(reason) do
+      :retryable ->
+        handle_retryable_error(state, payment, reason)
+
+      :definitive ->
+        handle_definitive_failure(state, payment, reason)
+
+      :unknown ->
+        handle_unknown_outcome(state, payment, reason)
+    end
+  end
+
+  defp process_result(state, payment, {:ok, unexpected}) do
+    Logger.warning(
+      "Executor: unexpected success response for " <>
+        Base.encode16(payment.payment_hash, case: :lower) <>
+        " — #{inspect(unexpected)}"
+    )
+
+    state
+  end
+
+  # Classifies an executor error into one of three buckets:
+  #   * `:retryable`  — a bounded transient the caller may want us to
+  #                     retry (structured phoenixd error naming
+  #                     temporary route/liquidity condition).
+  #   * `:definitive` — the payment definitively did NOT happen on
+  #                     Lightning. Safe to release the reservation.
+  #   * `:unknown`    — outcome undetermined (HTTP timeout, transport
+  #                     error, 5xx, task crash). MUST reconcile with
+  #                     the node before any release; never auto-retry.
+  #
+  # Conservative default: unknown. Any error whose semantics we can't
+  # positively identify (retryable transient / definitive negative)
+  # falls through to :unknown so the caller must reconcile before
+  # releasing — a Finch timeout on a payment that later settles must
+  # never trigger a release, because that's the double-spend path.
+  defp classify_error({:task_crash, _reason}), do: :unknown
+  defp classify_error(%{__exception__: true, __struct__: Mint.TransportError}), do: :unknown
+  defp classify_error({:http_error, status, _body}) when status >= 500, do: :unknown
+  defp classify_error({:http_error, 408, _body}), do: :unknown
+  defp classify_error({:http_error, 429, _body}), do: :unknown
+  defp classify_error(:timeout), do: :unknown
+  defp classify_error({:timeout, _reason}), do: :unknown
+
+  defp classify_error({:phoenixd_error, kind, _msg})
+       when kind in [:route_not_found, :insufficient_liquidity, :temporary_channel_failure] do
+    :retryable
+  end
+
+  defp classify_error({:http_error, status, _body}) when status >= 400 and status < 500 do
+    # 4xx from phoenixd on /payinvoice generally names a permanent
+    # problem (bad invoice, unsupported network, invoice already
+    # paid). We treat as definitive so the caller may release —
+    # phoenixd's own idempotent behaviour (rejecting a second
+    # /payinvoice for a payment it already settled) is handled by
+    # the submit-side dedup gate.
+    :definitive
+  end
+
+  defp classify_error(_other), do: :unknown
+
+  defp handle_retryable_error(state, payment, reason) do
     reason_str = inspect(reason)
 
     case Payment.mark_failed(payment, reason_str) do
@@ -361,21 +462,75 @@ defmodule FireBird.Executor do
     end
   end
 
-  defp process_result(state, payment, {:ok, unexpected}) do
-    Logger.warning(
-      "Executor: unexpected success response for " <>
-        Base.encode16(payment.payment_hash, case: :lower) <>
-        " — #{inspect(unexpected)}"
-    )
+  defp handle_definitive_failure(state, payment, reason) do
+    reason_str = inspect(reason)
 
-    state
+    case Payment.mark_definitively_failed(payment, reason_str) do
+      {:ok, failed} ->
+        :ets.insert(state.table_name, {payment.payment_hash, failed})
+
+        # Publish as PaymentExhausted so downstream release-on-failed
+        # consumers still trigger; :attempts reflects the actual
+        # attempt count (definitive failures skip the retry ladder).
+        PubSub.publish(state.pubsub, :payment, %PaymentExhausted{
+          payment_hash: payment.payment_hash,
+          amount_sats: payment.amount_sats,
+          reason: reason_str,
+          attempts: failed.attempt
+        })
+
+        :telemetry.execute(
+          [:fire_bird, :payment, :definitively_failed],
+          %{count: 1},
+          %{attempt: failed.attempt}
+        )
+
+        state
+
+      {:error, _reason} ->
+        state
+    end
   end
 
-  defp process_preimage(state, payment, preimage_hex, fee_raw) do
+  defp handle_unknown_outcome(state, payment, reason) do
+    reason_str = inspect(reason)
+
+    case Payment.mark_unknown(payment, reason_str) do
+      {:ok, unknown} ->
+        :ets.insert(state.table_name, {payment.payment_hash, unknown})
+
+        PubSub.publish(state.pubsub, :payment, %PaymentUnknown{
+          payment_hash: payment.payment_hash,
+          amount_sats: payment.amount_sats,
+          reason: reason_str,
+          attempt: unknown.attempt,
+          phoenixd_id: unknown.phoenixd_id
+        })
+
+        Logger.error(
+          "Executor: payment outcome UNKNOWN for " <>
+            Base.encode16(payment.payment_hash, case: :lower) <>
+            " — MUST reconcile before releasing (reason=#{reason_str})"
+        )
+
+        :telemetry.execute(
+          [:fire_bird, :payment, :unknown],
+          %{count: 1},
+          %{attempt: unknown.attempt}
+        )
+
+        state
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp process_preimage(state, payment, preimage_hex, fee_raw, phoenixd_id) do
     with {:ok, preimage} <- Base.decode16(preimage_hex, case: :mixed) do
       fee_sats = coerce_integer(fee_raw)
 
-      case Payment.mark_succeeded(payment, preimage, fee_sats) do
+      case Payment.mark_succeeded(payment, preimage, fee_sats, phoenixd_id) do
         {:ok, succeeded} ->
           :ets.insert(state.table_name, {payment.payment_hash, succeeded})
 

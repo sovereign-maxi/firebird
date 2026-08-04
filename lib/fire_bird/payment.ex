@@ -1,9 +1,23 @@
 defmodule FireBird.Payment do
   @moduledoc """
-  Outbound payment state machine: `:pending` → `:in_flight` → `:succeeded` | `:retrying` → `:exhausted`.
+  Outbound payment state machine:
 
-  Tracks Lightning payments through their lifecycle with exponential backoff
-  retry logic (max 3 attempts).
+      :pending → :in_flight ──┬── :succeeded
+                              ├── :retrying → :in_flight (loop, N attempts) → :exhausted
+                              ├── :failed    (definitive negative — safe to release)
+                              └── :unknown   (ambiguous outcome — MUST reconcile)
+
+  `:unknown` is the fail-closed state: transport errors, HTTP timeouts,
+  task crashes, and 5xx responses arrive here because the outcome on
+  Lightning is genuinely undetermined — the mint MUST NOT release the
+  caller's reservation until it has reconciled with the node. `:failed`
+  is reserved for explicit "payment definitively did not happen"
+  signals (structured phoenixd errors, 4xx responses that name a
+  reason).
+
+  Tracks Lightning payments through their lifecycle with exponential
+  backoff retry logic (max 3 attempts on `:retrying`; never on
+  `:unknown`).
   """
 
   @enforce_keys [:payment_hash, :bolt11, :amount_sats, :status, :created_at]
@@ -19,11 +33,23 @@ defmodule FireBird.Payment do
     :description,
     :external_id,
     :last_error,
+    # Phoenixd's own paymentId (UUID) captured from the /payinvoice
+    # response so recovery + resolver can reconcile via
+    # `/payments/outgoing/{paymentId}` when we have it. Nil when we
+    # never got a response back (transport error, task crash).
+    :phoenixd_id,
     attempt: 0,
     max_attempts: 3
   ]
 
-  @type status :: :pending | :in_flight | :succeeded | :retrying | :exhausted
+  @type status ::
+          :pending
+          | :in_flight
+          | :succeeded
+          | :retrying
+          | :exhausted
+          | :failed
+          | :unknown
 
   @type t :: %__MODULE__{
           payment_hash: binary(),
@@ -37,6 +63,7 @@ defmodule FireBird.Payment do
           description: String.t() | nil,
           external_id: String.t() | nil,
           last_error: String.t() | nil,
+          phoenixd_id: String.t() | nil,
           attempt: non_neg_integer(),
           max_attempts: pos_integer()
         }
@@ -83,13 +110,16 @@ defmodule FireBird.Payment do
   def mark_in_flight(%__MODULE__{}), do: {:error, :not_sendable}
 
   @doc """
-  Marks an in-flight payment as succeeded with preimage and fee.
+  Marks an in-flight payment as succeeded with preimage, fee, and
+  (when present) phoenixd's own paymentId for downstream reconciliation.
 
   Returns `{:error, :not_in_flight}` if the payment is not in-flight.
   """
-  @spec mark_succeeded(t(), binary(), non_neg_integer()) ::
+  @spec mark_succeeded(t(), binary(), non_neg_integer(), String.t() | nil) ::
           {:ok, t()} | {:error, :not_in_flight}
-  def mark_succeeded(%__MODULE__{status: :in_flight} = payment, preimage, fee_sats)
+  def mark_succeeded(payment, preimage, fee_sats, phoenixd_id \\ nil)
+
+  def mark_succeeded(%__MODULE__{status: :in_flight} = payment, preimage, fee_sats, phoenixd_id)
       when is_binary(preimage) and is_integer(fee_sats) do
     {:ok,
      %{
@@ -97,15 +127,23 @@ defmodule FireBird.Payment do
        | status: :succeeded,
          preimage: preimage,
          fee_sats: fee_sats,
-         completed_at: DateTime.utc_now()
+         completed_at: DateTime.utc_now(),
+         phoenixd_id: phoenixd_id || payment.phoenixd_id
      }}
   end
 
-  def mark_succeeded(%__MODULE__{}, _preimage, _fee_sats), do: {:error, :not_in_flight}
+  def mark_succeeded(%__MODULE__{}, _preimage, _fee_sats, _phoenixd_id),
+    do: {:error, :not_in_flight}
 
   @doc """
-  Marks an in-flight payment as failed. Transitions to `:retrying` if attempts
-  remain, or `:exhausted` if max attempts reached.
+  Marks an in-flight payment as failed AFTER a retryable-error attempt.
+  Transitions to `:retrying` if attempts remain, or `:exhausted` if
+  max attempts reached. Both status values are eligible for release
+  (the payment was fully classified as "did not settle on Lightning").
+
+  Reserved for errors the caller can classify as retryable (e.g. a
+  known-retryable phoenixd error) — ambiguous / transport / timeout
+  cases must go through `mark_unknown/2` instead.
 
   Returns `{:error, :not_in_flight}` if the payment is not in-flight.
   """
@@ -126,6 +164,50 @@ defmodule FireBird.Payment do
   end
 
   def mark_failed(%__MODULE__{}, _reason), do: {:error, :not_in_flight}
+
+  @doc """
+  Marks an in-flight payment as definitively failed (single terminal
+  transition — no retry) after an unambiguous negative signal from
+  the node (structured error, 4xx with a reason phrase). Callers may
+  safely release any reservation held against this payment.
+
+  Returns `{:error, :not_in_flight}` if the payment is not in-flight.
+  """
+  @spec mark_definitively_failed(t(), String.t()) ::
+          {:ok, t()} | {:error, :not_in_flight}
+  def mark_definitively_failed(%__MODULE__{status: :in_flight} = payment, reason)
+      when is_binary(reason) do
+    {:ok,
+     %{
+       payment
+       | status: :failed,
+         last_error: reason,
+         completed_at: DateTime.utc_now()
+     }}
+  end
+
+  def mark_definitively_failed(%__MODULE__{}, _reason), do: {:error, :not_in_flight}
+
+  @doc """
+  Marks an in-flight payment as `:unknown`. Terminal from the
+  executor's perspective — no auto-retry — but the caller MUST
+  reconcile with the node before releasing any reservation, because
+  the payment may still be in flight on Lightning.
+
+  Returns `{:error, :not_in_flight}` if the payment is not in-flight.
+  """
+  @spec mark_unknown(t(), String.t()) :: {:ok, t()} | {:error, :not_in_flight}
+  def mark_unknown(%__MODULE__{status: :in_flight} = payment, reason) when is_binary(reason) do
+    {:ok,
+     %{
+       payment
+       | status: :unknown,
+         last_error: reason,
+         completed_at: DateTime.utc_now()
+     }}
+  end
+
+  def mark_unknown(%__MODULE__{}, _reason), do: {:error, :not_in_flight}
 
   @doc """
   Calculates the next retry delay in milliseconds using exponential backoff.
