@@ -33,8 +33,18 @@ defmodule FireBird.Client do
   @doc "Checks if the Phoenixd node is reachable and healthy."
   @callback health_check(config()) :: :ok | {:error, term()}
 
-  @doc "Fetches an outgoing payment by its UUID."
+  @doc "Fetches an outgoing payment by its phoenixd-assigned UUID."
   @callback get_outgoing_payment(config(), String.t()) :: {:ok, map()} | {:error, term()}
+
+  @doc """
+  Fetches an outgoing payment by the invoice's real Lightning payment
+  hash (the 32-byte `p` tagged field of the bolt11). Preferred over
+  `get_outgoing_payment/2` when reconciling after a crash, because
+  the payment hash is derivable from the bolt11 the caller already
+  holds even if the phoenixd-assigned UUID was lost.
+  """
+  @callback get_outgoing_payment_by_hash(config(), payment_hash()) ::
+              {:ok, map()} | {:error, term()}
 
   @doc "Sends funds on-chain via splice-out. Returns the transaction ID."
   @callback send_onchain(config(), String.t(), pos_integer(), pos_integer()) ::

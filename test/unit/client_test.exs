@@ -41,7 +41,7 @@ defmodule FireBird.ClientTest do
 
     test "defines exactly 8 callbacks" do
       callbacks = FireBird.Client.behaviour_info(:callbacks)
-      assert length(callbacks) == 8
+      assert length(callbacks) == 9
     end
   end
 end

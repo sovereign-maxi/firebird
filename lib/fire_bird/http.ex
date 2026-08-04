@@ -88,6 +88,13 @@ defmodule FireBird.HTTP do
   end
 
   @impl FireBird.Client
+  def get_outgoing_payment_by_hash(%__MODULE__{} = config, payment_hash)
+      when is_binary(payment_hash) do
+    hex_hash = Base.encode16(payment_hash, case: :lower)
+    get(config, "/payments/outgoingbyhash/#{hex_hash}")
+  end
+
+  @impl FireBird.Client
   def get_info(%__MODULE__{} = config) do
     get(config, "/getinfo")
   end

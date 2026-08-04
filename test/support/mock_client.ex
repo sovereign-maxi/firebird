@@ -71,6 +71,12 @@ defmodule FireBird.MockClient do
   end
 
   @impl FireBird.Client
+  def get_outgoing_payment_by_hash(agent, payment_hash) do
+    record_call(agent, :get_outgoing_payment_by_hash, {payment_hash})
+    get_response(agent, :get_outgoing_payment_by_hash)
+  end
+
+  @impl FireBird.Client
   def health_check(agent) do
     record_call(agent, :health_check, {})
     get_response(agent, :health_check)
