@@ -71,6 +71,19 @@ defmodule FireBird.Bolt11Test do
     test "accepts picobitcoin amounts >= 1 sat" do
       assert {:ok, 1} = Bolt11.parse_amount("lnbc10000p1pdummy")
     end
+
+    test "rejects picobitcoin amounts with msat-precision remainder" do
+      # 1_999_000 pBTC = 199.9 sats — has msat precision the mint
+      # can't represent. Previous implementation silently floored to
+      # 199, so upstream callers that enforced parsed_sats ==
+      # paid_sats lost the remainder per melt.
+      assert {:error, :sub_satoshi} = Bolt11.parse_amount("lnbc1999000p1pdummy")
+    end
+
+    test "accepts whole-satoshi picobitcoin amounts" do
+      # 2_000_000 pBTC = 200.0 sats — clean, no remainder.
+      assert {:ok, 200} = Bolt11.parse_amount("lnbc2000000p1pdummy")
+    end
   end
 
   describe "payment_hash/1" do

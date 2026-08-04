@@ -20,6 +20,8 @@ defmodule FireBird.Payment do
   `:unknown`).
   """
 
+  require Logger
+
   @enforce_keys [:payment_hash, :bolt11, :amount_sats, :status, :created_at]
   defstruct [
     :payment_hash,
@@ -39,6 +41,14 @@ defmodule FireBird.Payment do
     # never got a response back (transport error, task crash).
     :phoenixd_id,
     :fee_limit_sats,
+    # The invoice's real 32-byte Lightning payment hash (`p` tagged
+    # field). Distinct from `:payment_hash`, which callers currently
+    # use as a local tracking key that may or may not match the real
+    # LN hash. When set, `mark_succeeded/4` validates the preimage
+    # against this value — the fail-closed proof-of-payment check.
+    # When nil, the preimage is accepted unvalidated and a warning
+    # is logged.
+    :ln_payment_hash,
     attempt: 0,
     max_attempts: 3
   ]
@@ -66,6 +76,7 @@ defmodule FireBird.Payment do
           last_error: String.t() | nil,
           phoenixd_id: String.t() | nil,
           fee_limit_sats: non_neg_integer() | nil,
+          ln_payment_hash: binary() | nil,
           attempt: non_neg_integer(),
           max_attempts: pos_integer()
         }
@@ -121,27 +132,64 @@ defmodule FireBird.Payment do
   Marks an in-flight payment as succeeded with preimage, fee, and
   (when present) phoenixd's own paymentId for downstream reconciliation.
 
-  Returns `{:error, :not_in_flight}` if the payment is not in-flight.
+  When `payment.ln_payment_hash` is set, the preimage MUST hash to
+  it — the fail-closed proof-of-payment check that makes an outgoing
+  success a genuine settlement rather than "phoenixd said so".
+  When `ln_payment_hash` is nil, the caller hasn't provided the real
+  hash to check against; the preimage is accepted unvalidated and
+  a warning is logged.
+
+  Returns `{:error, :not_in_flight}` if the payment is not in-flight,
+  or `{:error, :invalid_preimage}` if validation fails.
   """
   @spec mark_succeeded(t(), binary(), non_neg_integer(), String.t() | nil) ::
-          {:ok, t()} | {:error, :not_in_flight}
+          {:ok, t()} | {:error, :not_in_flight | :invalid_preimage}
   def mark_succeeded(payment, preimage, fee_sats, phoenixd_id \\ nil)
 
   def mark_succeeded(%__MODULE__{status: :in_flight} = payment, preimage, fee_sats, phoenixd_id)
       when is_binary(preimage) and is_integer(fee_sats) do
-    {:ok,
-     %{
-       payment
-       | status: :succeeded,
-         preimage: preimage,
-         fee_sats: fee_sats,
-         completed_at: DateTime.utc_now(),
-         phoenixd_id: phoenixd_id || payment.phoenixd_id
-     }}
+    case validate_preimage_against_hash(preimage, payment.ln_payment_hash) do
+      :ok ->
+        {:ok,
+         %{
+           payment
+           | status: :succeeded,
+             preimage: preimage,
+             fee_sats: fee_sats,
+             completed_at: DateTime.utc_now(),
+             phoenixd_id: phoenixd_id || payment.phoenixd_id
+         }}
+
+      {:error, _reason} = err ->
+        err
+    end
   end
 
   def mark_succeeded(%__MODULE__{}, _preimage, _fee_sats, _phoenixd_id),
     do: {:error, :not_in_flight}
+
+  defp validate_preimage_against_hash(_preimage, nil) do
+    Logger.warning(
+      "Payment: mark_succeeded called without ln_payment_hash — " <>
+        "preimage accepted unvalidated (proof of payment NOT checked)"
+    )
+
+    :ok
+  end
+
+  defp validate_preimage_against_hash(preimage, expected_hash)
+       when is_binary(expected_hash) and byte_size(expected_hash) == 32 do
+    computed = :crypto.hash(:sha256, preimage)
+
+    if :crypto.hash_equals(computed, expected_hash) do
+      :ok
+    else
+      {:error, :invalid_preimage}
+    end
+  end
+
+  defp validate_preimage_against_hash(_preimage, _malformed_hash),
+    do: {:error, :invalid_preimage}
 
   @doc """
   Marks an in-flight payment as failed AFTER a retryable-error attempt.

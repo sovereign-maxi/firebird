@@ -87,12 +87,30 @@ defmodule FireBird.Bolt11 do
       {amount, ""} ->
         multiplier_char = multiplier |> String.to_charlist() |> hd()
         denominator = Map.fetch!(@multiplier_denominators, multiplier_char)
-        sats = div(amount * @sats_per_btc, denominator)
+        numerator = amount * @sats_per_btc
 
-        if sats == 0 and amount > 0 do
-          {:error, :sub_satoshi}
-        else
-          {:ok, sats}
+        cond do
+          numerator == 0 ->
+            {:ok, 0}
+
+          # msat-precision amounts (like 199.9 sats) MUST NOT floor-
+          # truncate — the previous `div/2` implementation silently
+          # dropped the fractional satoshi, so upstream callers that
+          # enforced `parsed_sats == paid_sats` bled the remainder to
+          # the payer on every melt (systematic 1-sat drift per such
+          # invoice). Reject the invoice instead: whole-satoshi
+          # accounting is a hard requirement of every caller today.
+          rem(numerator, denominator) != 0 ->
+            {:error, :sub_satoshi}
+
+          true ->
+            sats = div(numerator, denominator)
+
+            if sats == 0 and amount > 0 do
+              {:error, :sub_satoshi}
+            else
+              {:ok, sats}
+            end
         end
 
       _other ->

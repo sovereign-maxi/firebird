@@ -551,32 +551,46 @@ defmodule FireBird.Executor do
   end
 
   defp process_preimage(state, payment, preimage_hex, fee_raw, phoenixd_id) do
-    with {:ok, preimage} <- Base.decode16(preimage_hex, case: :mixed) do
-      fee_sats = coerce_integer(fee_raw)
+    case Base.decode16(preimage_hex, case: :mixed) do
+      {:ok, preimage} ->
+        fee_sats = coerce_integer(fee_raw)
+        apply_preimage(state, payment, preimage, fee_sats, phoenixd_id)
 
-      case Payment.mark_succeeded(payment, preimage, fee_sats, phoenixd_id) do
-        {:ok, succeeded} ->
-          :ets.insert(state.table_name, {payment.payment_hash, succeeded})
-
-          PubSub.publish(state.pubsub, :payment, %PaymentSent{
-            payment_hash: payment.payment_hash,
-            amount_sats: payment.amount_sats,
-            fee_sats: fee_sats,
-            preimage: preimage
-          })
-
-          :telemetry.execute(
-            [:fire_bird, :payment, :success],
-            %{count: 1, fee_sats: fee_sats},
-            %{amount_sats: payment.amount_sats}
-          )
-
-        {:error, _reason} ->
-          :ok
-      end
+      :error ->
+        state
     end
+  end
 
-    state
+  defp apply_preimage(state, payment, preimage, fee_sats, phoenixd_id) do
+    case Payment.mark_succeeded(payment, preimage, fee_sats, phoenixd_id) do
+      {:ok, succeeded} ->
+        :ets.insert(state.table_name, {payment.payment_hash, succeeded})
+
+        PubSub.publish(state.pubsub, :payment, %PaymentSent{
+          payment_hash: payment.payment_hash,
+          amount_sats: payment.amount_sats,
+          fee_sats: fee_sats,
+          preimage: preimage
+        })
+
+        :telemetry.execute(
+          [:fire_bird, :payment, :success],
+          %{count: 1, fee_sats: fee_sats},
+          %{amount_sats: payment.amount_sats}
+        )
+
+        state
+
+      {:error, :invalid_preimage} ->
+        # phoenixd returned a "success" whose preimage does not
+        # hash to the invoice's payment hash. Not proof of payment.
+        # Route through the unknown-outcome path so the caller
+        # holds their reservation and reconciles with the node.
+        handle_unknown_outcome(state, payment, :invalid_preimage)
+
+      {:error, _reason} ->
+        state
+    end
   end
 
   defp cleanup_terminal(state) do

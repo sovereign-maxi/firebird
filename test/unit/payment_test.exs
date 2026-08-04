@@ -98,6 +98,74 @@ defmodule FireBird.PaymentTest do
       preimage = :crypto.strong_rand_bytes(32)
       assert {:error, :not_in_flight} = Payment.mark_succeeded(payment, preimage, 0)
     end
+
+    test "validates preimage against ln_payment_hash when set" do
+      preimage = :crypto.strong_rand_bytes(32)
+      real_hash = :crypto.hash(:sha256, preimage)
+
+      payment =
+        Payment.new(
+          payment_hash: :crypto.strong_rand_bytes(32),
+          bolt11: "lnbc1_test_valid_preimage",
+          amount_sats: 1_000,
+          created_at: DateTime.utc_now(),
+          ln_payment_hash: real_hash
+        )
+
+      {:ok, in_flight} = Payment.mark_in_flight(payment)
+
+      assert {:ok, succeeded} = Payment.mark_succeeded(in_flight, preimage, 5)
+      assert succeeded.status == :succeeded
+    end
+
+    test "rejects preimage that does not hash to ln_payment_hash" do
+      preimage = :crypto.strong_rand_bytes(32)
+      wrong_hash = :crypto.strong_rand_bytes(32)
+
+      payment =
+        Payment.new(
+          payment_hash: :crypto.strong_rand_bytes(32),
+          bolt11: "lnbc1_test_bad_preimage",
+          amount_sats: 1_000,
+          created_at: DateTime.utc_now(),
+          ln_payment_hash: wrong_hash
+        )
+
+      {:ok, in_flight} = Payment.mark_in_flight(payment)
+
+      assert {:error, :invalid_preimage} = Payment.mark_succeeded(in_flight, preimage, 5)
+    end
+
+    test "rejects malformed ln_payment_hash (not 32 bytes)" do
+      preimage = :crypto.strong_rand_bytes(32)
+
+      payment =
+        Payment.new(
+          payment_hash: :crypto.strong_rand_bytes(32),
+          bolt11: "lnbc1_test_malformed",
+          amount_sats: 1_000,
+          created_at: DateTime.utc_now(),
+          ln_payment_hash: <<0, 1, 2>>
+        )
+
+      {:ok, in_flight} = Payment.mark_in_flight(payment)
+
+      assert {:error, :invalid_preimage} = Payment.mark_succeeded(in_flight, preimage, 5)
+    end
+
+    test "accepts unvalidated (with warning) when ln_payment_hash is nil", %{payment: payment} do
+      preimage = :crypto.strong_rand_bytes(32)
+      assert payment.ln_payment_hash == nil
+      {:ok, in_flight} = Payment.mark_in_flight(payment)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, %{status: :succeeded}} =
+                   Payment.mark_succeeded(in_flight, preimage, 5)
+        end)
+
+      assert log =~ "ln_payment_hash"
+    end
   end
 
   describe "mark_failed/2" do
