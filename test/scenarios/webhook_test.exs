@@ -3,6 +3,8 @@ defmodule FireBird.WebhookTest do
 
   alias FireBird.Webhook
 
+  @moduletag :scenario
+
   @secret "test-webhook-secret"
 
   setup do

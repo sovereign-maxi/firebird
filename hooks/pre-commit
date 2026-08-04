@@ -9,8 +9,19 @@ mix format
 echo "==> mix credo --strict"
 mix credo --strict
 
-echo "==> mix test"
-mix test
+# Run each test category independently so failures are isolated.
+failed=()
+
+echo "==> mix test (unit)"
+mix test test/unit/ || failed+=(unit)
+
+echo "==> mix test --only scenario"
+mix test --only scenario || failed+=(scenario)
+
+if [ ${#failed[@]} -gt 0 ]; then
+  echo "FAILED test suites: ${failed[*]}"
+  exit 1
+fi
 
 echo "==> mix dialyzer"
 mix dialyzer --format short

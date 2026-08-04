@@ -4,6 +4,8 @@ defmodule FireBird.MonitorTest do
   alias FireBird.MockClient
   alias FireBird.Monitor
 
+  @moduletag :scenario
+
   setup do
     n = System.unique_integer([:positive])
     table = :"liq_mon_test_#{n}"

@@ -6,6 +6,8 @@ defmodule FireBird.ExecutorTest do
   alias FireBird.MockWAL
   alias FireBird.Payment
 
+  @moduletag :scenario
+
   setup do
     n = System.unique_integer([:positive])
     table = :"pay_exec_test_#{n}"
@@ -419,7 +421,7 @@ defmodule FireBird.ExecutorTest do
   end
 
   describe "WAL recovery" do
-    test "recovers in-flight payments from WAL on init" do
+    test "recovered in-flight payments become :unknown and publish PaymentUnknown" do
       n = System.unique_integer([:positive])
       table = :"pay_recover_#{n}"
       pubsub = :"pay_recover_pubsub_#{n}"
@@ -430,19 +432,10 @@ defmodule FireBird.ExecutorTest do
       start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
       start_supervised!({MockWAL, name: wal_name}, id: wal_name)
 
-      # Pre-populate WAL with an in-flight payment
+      # Pre-populate WAL as if the VM crashed mid-flight.
       payment = build_test_payment(max_attempts: 3)
       in_flight = %{payment | status: :in_flight, attempt: 1}
       MockWAL.append(wal_name, in_flight)
-
-      preimage = :crypto.strong_rand_bytes(32)
-      preimage_hex = Base.encode16(preimage, case: :lower)
-
-      MockClient.set_response(
-        client_name,
-        :pay_invoice,
-        {:ok, %{"preimage" => preimage_hex, "fees" => 0}}
-      )
 
       Registry.register(pubsub, :payment, [])
 
@@ -460,25 +453,73 @@ defmodule FireBird.ExecutorTest do
           id: {Executor, n}
         )
 
-      # Poll until recovered payment appears in ETS
+      # Recovery must NOT auto-retry — phoenixd may have already
+      # settled the original request before the crash. Payment lands
+      # as :unknown and PaymentUnknown fires so the caller holds
+      # its reservation.
       FireBirdHelpers.await_condition(fn ->
-        match?({:ok, _}, Executor.lookup(table, payment.payment_hash))
+        match?({:ok, %{status: :unknown}}, Executor.lookup(table, payment.payment_hash))
       end)
 
-      assert {:ok, found} = Executor.lookup(table, payment.payment_hash)
-      assert found.status in [:retrying, :in_flight, :succeeded]
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
 
-      # Wait for retry to succeed
-      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentSent{}}, 5_000
+      # And no pay_invoice call happened during recovery.
+      assert MockClient.calls(client_name, :pay_invoice) == []
 
       assert {:ok, result} = Executor.lookup(table, payment.payment_hash)
-      assert result.status == :succeeded
+      assert result.status == :unknown
+      assert result.completed_at != nil
 
       stop_supervised!({Executor, n})
       assert Process.alive?(pid) == false
     end
 
-    test "marks max-attempt payments as exhausted on recovery" do
+    test "recovered :unknown payment rejects any duplicate submit until reconciled" do
+      n = System.unique_integer([:positive])
+      table = :"pay_dup_after_recover_#{n}"
+      pubsub = :"pay_dup_after_recover_pubsub_#{n}"
+      client_name = :"pay_dup_after_recover_client_#{n}"
+      wal_name = :"pay_dup_after_recover_wal_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+      start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+
+      payment = build_test_payment(max_attempts: 3)
+      in_flight = %{payment | status: :in_flight, attempt: 1}
+      MockWAL.append(wal_name, in_flight)
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             wal: {MockWAL, wal_name},
+             name: :"pay_dup_after_recover_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :unknown}}, Executor.lookup(table, payment.payment_hash))
+      end)
+
+      # Submitting the same payment_hash while it's still :unknown
+      # must be rejected — a resubmit could double-pay a payment
+      # phoenixd may already have settled.
+      assert {:error, {:duplicate, {:already_terminal, :unknown}}} =
+               Executor.submit(pid, payment)
+    end
+
+    test "even a max-attempt payment recovers as :unknown, not :exhausted" do
+      # The previous contract auto-exhausted anything already at
+      # max_attempts. Under the fail-closed discipline, "we crashed
+      # with this in flight" is always ambiguous regardless of
+      # attempt count — exhaustion requires the retry ladder to
+      # have completed cleanly, which it can't when the VM died.
       n = System.unique_integer([:positive])
       table = :"pay_exhaust_#{n}"
       pubsub = :"pay_exhaust_pubsub_#{n}"
@@ -489,7 +530,6 @@ defmodule FireBird.ExecutorTest do
       start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
       start_supervised!({MockWAL, name: wal_name}, id: wal_name)
 
-      # Pre-populate WAL with a payment at max attempts
       payment = build_test_payment(max_attempts: 2)
       in_flight = %{payment | status: :in_flight, attempt: 2}
       MockWAL.append(wal_name, in_flight)
@@ -508,13 +548,12 @@ defmodule FireBird.ExecutorTest do
           id: {Executor, n}
         )
 
-      # Poll until recovery marks payment as exhausted
       FireBirdHelpers.await_condition(fn ->
-        match?({:ok, %{status: :exhausted}}, Executor.lookup(table, payment.payment_hash))
+        match?({:ok, %{status: :unknown}}, Executor.lookup(table, payment.payment_hash))
       end)
 
       assert {:ok, result} = Executor.lookup(table, payment.payment_hash)
-      assert result.status == :exhausted
+      assert result.status == :unknown
       assert result.completed_at != nil
     end
 

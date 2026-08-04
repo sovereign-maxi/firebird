@@ -3,6 +3,8 @@ defmodule FireBird.CleanerTest do
 
   alias FireBird.Cleaner
 
+  @moduletag :scenario
+
   setup do
     n = System.unique_integer([:positive])
     table = :"dedup_cleaner_test_#{n}"

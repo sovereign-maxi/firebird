@@ -4,6 +4,8 @@ defmodule FireBird.ManagerTest do
   alias FireBird.Manager
   alias FireBird.MockClient
 
+  @moduletag :scenario
+
   setup do
     n = System.unique_integer([:positive])
     table = :"invoice_mgr_test_#{n}"

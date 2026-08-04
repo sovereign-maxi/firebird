@@ -109,7 +109,7 @@ defmodule FireBird.Executor do
 
     :ets.new(table_name, [:named_table, :set, :public, read_concurrency: true])
 
-    recovered_timers = recover_from_wal(wal, table_name)
+    recovered_timers = recover_from_wal(wal, table_name, pubsub)
 
     state = %__MODULE__{
       client_mod: client_mod,
@@ -251,25 +251,27 @@ defmodule FireBird.Executor do
     :ok
   end
 
-  defp recover_from_wal(nil, _table_name), do: %{}
+  defp recover_from_wal(nil, _table_name, _pubsub), do: %{}
 
-  defp recover_from_wal({wal_mod, wal_config}, table_name) do
+  defp recover_from_wal({wal_mod, wal_config}, table_name, pubsub) do
     case wal_mod.recover(wal_config) do
       {:ok, payments} when is_list(payments) ->
         count = length(payments)
 
         if count > 0 do
-          Logger.info("Executor: recovering #{count} payments from WAL")
+          Logger.warning(
+            "Executor: recovering #{count} in-flight payments from WAL — " <>
+              "marking each :unknown; caller must reconcile before releasing"
+          )
         end
 
-        payments
-        |> Enum.with_index()
-        |> Enum.reduce(%{}, fn {payment, index}, timers ->
-          case recover_single(payment, table_name, index) do
-            {:ok, hash, timer_ref} -> Map.put(timers, hash, timer_ref)
-            :skip -> timers
-          end
-        end)
+        Enum.each(payments, fn payment -> recover_single(payment, table_name, pubsub) end)
+
+        # No retry timers: recovered payments are ambiguous by
+        # definition (the VM crashed while the phoenixd task was in
+        # flight) and must be reconciled against the node before any
+        # further action, per the C1/C2 discipline.
+        %{}
 
       {:error, reason} ->
         Logger.error("Executor: WAL recovery failed: #{inspect(reason)}")
@@ -277,23 +279,44 @@ defmodule FireBird.Executor do
     end
   end
 
-  defp recover_single(%Payment{} = payment, table_name, index) do
-    if payment.attempt >= payment.max_attempts do
-      exhausted = %{payment | status: :exhausted, completed_at: DateTime.utc_now()}
-      :ets.insert(table_name, {payment.payment_hash, exhausted})
-      :skip
-    else
-      retrying = %{payment | status: :retrying}
-      :ets.insert(table_name, {payment.payment_hash, retrying})
-      delay = 500 + index * 200
-      timer_ref = Process.send_after(self(), {:retry, payment.payment_hash}, delay)
-      {:ok, payment.payment_hash, timer_ref}
-    end
+  # Restores a WAL-persisted payment as :unknown and publishes a
+  # PaymentUnknown event so downstream consumers (mint quote layer)
+  # transition to :settlement_unknown and hold reservations. Never
+  # auto-retries — the previous auto-retry path bypassed the
+  # submit-side dedup gate and could double-pay a payment that
+  # phoenixd had already settled before the VM crashed.
+  defp recover_single(%Payment{} = payment, table_name, pubsub) do
+    reason = "wal_recovery: vm_crash_before_settlement"
+
+    unknown = %{
+      payment
+      | status: :unknown,
+        last_error: reason,
+        completed_at: DateTime.utc_now()
+    }
+
+    :ets.insert(table_name, {payment.payment_hash, unknown})
+
+    PubSub.publish(pubsub, :payment, %PaymentUnknown{
+      payment_hash: payment.payment_hash,
+      amount_sats: payment.amount_sats,
+      reason: reason,
+      attempt: payment.attempt,
+      phoenixd_id: payment.phoenixd_id
+    })
+
+    :telemetry.execute(
+      [:fire_bird, :payment, :recovered_unknown],
+      %{count: 1},
+      %{attempt: payment.attempt}
+    )
+
+    :ok
   end
 
-  defp recover_single(_other, _table_name, _index) do
+  defp recover_single(_other, _table_name, _pubsub) do
     Logger.warning("Executor: skipping unrecognized WAL entry")
-    :skip
+    :ok
   end
 
   defp execute_payment(state, payment) do

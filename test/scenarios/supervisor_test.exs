@@ -3,6 +3,8 @@ defmodule FireBird.SupervisorTest do
 
   alias FireBird.MockClient
 
+  @moduletag :scenario
+
   setup do
     n = System.unique_integer([:positive])
 
@@ -330,26 +332,17 @@ defmodule FireBird.SupervisorTest do
   end
 
   describe "WAL passthrough to PaymentExecutor" do
-    test "WAL recovery runs through full supervisor startup", ctx do
+    test "WAL recovery through full supervisor startup lands payment as :unknown", ctx do
       sup_name = :"sup_wal_#{ctx.n}"
       pay_table = :"sup_wal_pay_#{ctx.n}"
       wal_name = :"sup_wal_agent_#{ctx.n}"
 
       start_supervised!({FireBird.MockWAL, name: wal_name}, id: wal_name)
 
-      # Pre-populate WAL with an in-flight payment
+      # Pre-populate WAL as if the VM crashed mid-flight.
       payment = FireBirdHelpers.build_payment(max_attempts: 3)
       in_flight = %{payment | status: :in_flight, attempt: 1}
       FireBird.MockWAL.append(wal_name, in_flight)
-
-      preimage = :crypto.strong_rand_bytes(32)
-      preimage_hex = Base.encode16(preimage, case: :lower)
-
-      MockClient.set_response(
-        ctx.client_name,
-        :pay_invoice,
-        {:ok, %{"preimage" => preimage_hex, "fees" => 0}}
-      )
 
       pubsub_name = :"sup_wal_pubsub_#{ctx.n}"
 
@@ -371,16 +364,20 @@ defmodule FireBird.SupervisorTest do
           dedup_interval_ms: 600_000
         )
 
-      # Poll until WAL recovery completes
+      # Recovery must never auto-retry — payment lands as :unknown,
+      # caller reconciles.
       FireBirdHelpers.await_condition(fn ->
         match?(
-          {:ok, %{status: :succeeded}},
+          {:ok, %{status: :unknown}},
           FireBird.Executor.lookup(pay_table, payment.payment_hash)
         )
       end)
 
       assert {:ok, result} = FireBird.Executor.lookup(pay_table, payment.payment_hash)
-      assert result.status == :succeeded
+      assert result.status == :unknown
+
+      # And no /payinvoice call fired.
+      assert MockClient.calls(ctx.client_name, :pay_invoice) == []
 
       Supervisor.stop(sup_pid)
     end
