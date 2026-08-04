@@ -110,5 +110,19 @@ defmodule FireBird.Bolt11Test do
       # Amount-only prefix with checksum but no `p` tag.
       assert {:error, _reason} = Bolt11.payment_hash("lnbc1m1pdummy" <> String.duplicate("q", 40))
     end
+
+    test "handles amounts containing the digit 1 (last-1 separator rule)" do
+      # bech32's separator is the LAST `1` — splitting on the first `1`
+      # cuts through amount digits like `10u`, `1u`, or `2510u`. Same
+      # tagged-field payload as the spec vector, three different HRPs:
+      # all three MUST return the spec hash.
+      hrp_and_data =
+        "1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpuaztrnwngzn3kdzw5hydlzf03qdgm2hdq27cqv3agm2awhz5se903vruatfhq77w3ls4evs3ch9zw97j25emudupq63nyw24cg27h2rspfj9srp"
+
+      for amount_prefix <- ["lnbc1u", "lnbc10u", "lnbc2510u"] do
+        assert {:ok, @spec_hash} = Bolt11.payment_hash(amount_prefix <> hrp_and_data),
+               "expected spec-hash extraction from #{amount_prefix}<data> after last-1 split fix"
+      end
+    end
   end
 end

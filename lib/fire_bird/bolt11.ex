@@ -124,17 +124,31 @@ defmodule FireBird.Bolt11 do
 
   # Strip the amount + multiplier + `1` separator, leaving just the
   # bech32 data payload (including the 6-char checksum tail).
+  #
+  # The bech32 separator per BIP-173 is the LAST `1` in the string —
+  # amount digits can contain `1` (`10u`, `1u`, `2510u`) and the data
+  # alphabet excludes `1` entirely, so the trailing `1` is
+  # unambiguous. Splitting on the FIRST `1` cuts through any amount
+  # with a `1` digit and yields a payload that fails bech32 decoding.
   defp data_chars(rest) when is_binary(rest) do
-    case String.split(rest, "1", parts: 2) do
-      [_amount_prefix, payload] when byte_size(payload) > 6 ->
-        # Trim the 6-char bech32 checksum — we don't verify it here;
-        # payment_hash extraction is downstream of phoenixd's own
-        # validation on invoice creation.
-        chars = String.to_charlist(payload)
-        {:ok, Enum.drop(chars, -6)}
+    parts = String.split(rest, "1")
 
-      _other ->
+    case parts do
+      [_only_one_part] ->
         {:error, :malformed_payload}
+
+      _many ->
+        payload = List.last(parts)
+
+        if byte_size(payload) > 6 do
+          # Trim the 6-char bech32 checksum — we don't verify it here;
+          # payment_hash extraction is downstream of phoenixd's own
+          # validation on invoice creation.
+          chars = String.to_charlist(payload)
+          {:ok, Enum.drop(chars, -6)}
+        else
+          {:error, :malformed_payload}
+        end
     end
   end
 
