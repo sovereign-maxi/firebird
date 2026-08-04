@@ -13,7 +13,7 @@ defmodule FireBird.HTTP do
         finch_name: MyApp.Finch
       )
 
-      FireBird.HTTP.create_invoice(config, 1000, "test invoice")
+      FireBird.HTTP.create_invoice(config, 1000, "test invoice", nil)
   """
 
   @behaviour FireBird.Client
@@ -47,16 +47,22 @@ defmodule FireBird.HTTP do
   end
 
   @impl FireBird.Client
-  def create_invoice(%__MODULE__{} = config, amount_sats, description)
-      when is_integer(amount_sats) and amount_sats > 0 do
-    body =
-      URI.encode_query(%{
-        "amountSat" => amount_sats,
-        "description" => sanitize_description(description)
-      })
+  def create_invoice(%__MODULE__{} = config, amount_sats, description, expiry_seconds)
+      when is_integer(amount_sats) and amount_sats > 0 and
+             (is_nil(expiry_seconds) or (is_integer(expiry_seconds) and expiry_seconds > 0)) do
+    base_params = %{
+      "amountSat" => amount_sats,
+      "description" => sanitize_description(description)
+    }
 
-    post(config, "/createinvoice", body)
+    params = maybe_put_expiry(base_params, expiry_seconds)
+    post(config, "/createinvoice", URI.encode_query(params))
   end
+
+  defp maybe_put_expiry(params, nil), do: params
+
+  defp maybe_put_expiry(params, seconds) when is_integer(seconds) and seconds > 0,
+    do: Map.put(params, "expirySeconds", seconds)
 
   @impl FireBird.Client
   def pay_invoice(%__MODULE__{} = config, bolt11, amount_sats, description, fee_limit_sats)

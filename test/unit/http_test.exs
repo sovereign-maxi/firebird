@@ -122,7 +122,7 @@ defmodule FireBird.HTTPTest do
         Plug.Conn.resp(conn, 200, Jason.encode!(%{"paymentHash" => "abc", "serialized" => "lnbc"}))
       end)
 
-      assert {:ok, %{"paymentHash" => "abc"}} = HTTP.create_invoice(config, 1000, "test invoice")
+      assert {:ok, %{"paymentHash" => "abc"}} = HTTP.create_invoice(config, 1000, "test invoice", nil)
     end
 
     test "create_invoice/3 preserves non-ASCII Unicode in descriptions",
@@ -136,10 +136,10 @@ defmodule FireBird.HTTPTest do
         Plug.Conn.resp(conn, 200, Jason.encode!(%{"paymentHash" => "abc"}))
       end)
 
-      assert {:ok, _resp} = HTTP.create_invoice(config, 1000, "café 日本語")
+      assert {:ok, _resp} = HTTP.create_invoice(config, 1000, "café 日本語", nil)
     end
 
-    test "create_invoice/3 sanitizes long descriptions",
+    test "create_invoice/4 sanitizes long descriptions",
          %{bypass: bypass, config: config} do
       Bypass.expect_once(bypass, "POST", "/createinvoice", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -150,7 +150,35 @@ defmodule FireBird.HTTPTest do
       end)
 
       long_desc = String.duplicate("a", 700)
-      assert {:ok, _resp} = HTTP.create_invoice(config, 1000, long_desc)
+      assert {:ok, _resp} = HTTP.create_invoice(config, 1000, long_desc, nil)
+    end
+
+    test "create_invoice/4 forwards expiry_seconds as expirySeconds",
+         %{bypass: bypass, config: config} do
+      Bypass.expect_once(bypass, "POST", "/createinvoice", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+        assert params["expirySeconds"] == "3600"
+
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"paymentHash" => "abc"}))
+      end)
+
+      assert {:ok, _resp} = HTTP.create_invoice(config, 1000, "expiring", 3_600)
+    end
+
+    test "create_invoice/4 omits expirySeconds when nil",
+         %{bypass: bypass, config: config} do
+      Bypass.expect_once(bypass, "POST", "/createinvoice", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+
+        refute Map.has_key?(params, "expirySeconds"),
+               "nil expiry_seconds must omit the key so phoenixd's default (1 week) applies"
+
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"paymentHash" => "abc"}))
+      end)
+
+      assert {:ok, _resp} = HTTP.create_invoice(config, 1000, "no-expiry", nil)
     end
 
     test "pay_invoice/5 sends POST with invoice and amount (no fee cap)",
@@ -293,7 +321,7 @@ defmodule FireBird.HTTPTest do
       tasks =
         for i <- 1..10 do
           Task.async(fn ->
-            HTTP.create_invoice(config, i * 100, "invoice #{i}")
+            HTTP.create_invoice(config, i * 100, "invoice #{i}", nil)
           end)
         end
 
@@ -325,10 +353,10 @@ defmodule FireBird.HTTPTest do
 
       tasks = [
         Task.async(fn -> HTTP.get_balance(config) end),
-        Task.async(fn -> HTTP.create_invoice(config, 1000, "test") end),
+        Task.async(fn -> HTTP.create_invoice(config, 1000, "test", nil) end),
         Task.async(fn -> HTTP.health_check(config) end),
         Task.async(fn -> HTTP.get_balance(config) end),
-        Task.async(fn -> HTTP.create_invoice(config, 2000, "test2") end)
+        Task.async(fn -> HTTP.create_invoice(config, 2000, "test2", nil) end)
       ]
 
       results = Task.await_many(tasks, 5_000)

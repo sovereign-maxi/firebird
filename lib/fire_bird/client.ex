@@ -13,8 +13,15 @@ defmodule FireBird.Client do
   @type payment_hash :: binary()
   @type bolt11 :: String.t()
 
-  @doc "Creates a Lightning invoice and returns the raw API response."
-  @callback create_invoice(config(), pos_integer(), String.t()) ::
+  @doc """
+  Creates a Lightning invoice and returns the raw API response. The
+  4th argument is an optional invoice-expiry override in seconds
+  forwarded as phoenixd's `expirySeconds`; `nil` uses phoenixd's
+  default (currently one week). Callers with a shorter application-
+  layer TTL (a mint quote, a checkout window) SHOULD pass a value
+  ≤ that TTL so a late-paying user can't miss their claim window.
+  """
+  @callback create_invoice(config(), pos_integer(), String.t(), pos_integer() | nil) ::
               {:ok, map()} | {:error, term()}
 
   @doc """

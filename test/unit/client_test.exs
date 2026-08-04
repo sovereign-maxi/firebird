@@ -2,9 +2,9 @@ defmodule FireBird.ClientTest do
   use ExUnit.Case, async: true
 
   describe "behaviour callbacks" do
-    test "defines create_invoice/3" do
+    test "defines create_invoice/4" do
       callbacks = FireBird.Client.behaviour_info(:callbacks)
-      assert {:create_invoice, 3} in callbacks
+      assert {:create_invoice, 4} in callbacks
     end
 
     test "defines pay_invoice/5" do
