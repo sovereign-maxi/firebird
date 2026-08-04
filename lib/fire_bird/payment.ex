@@ -38,6 +38,7 @@ defmodule FireBird.Payment do
     # `/payments/outgoing/{paymentId}` when we have it. Nil when we
     # never got a response back (transport error, task crash).
     :phoenixd_id,
+    :fee_limit_sats,
     attempt: 0,
     max_attempts: 3
   ]
@@ -64,6 +65,7 @@ defmodule FireBird.Payment do
           external_id: String.t() | nil,
           last_error: String.t() | nil,
           phoenixd_id: String.t() | nil,
+          fee_limit_sats: non_neg_integer() | nil,
           attempt: non_neg_integer(),
           max_attempts: pos_integer()
         }
@@ -83,6 +85,12 @@ defmodule FireBird.Payment do
   ## Optional fields
     - `:description` - Human-readable description
     - `:external_id` - Caller-provided correlation ID
+    - `:fee_limit_sats` - Flat routing-fee cap in sats forwarded to
+      phoenixd's `maxFeeFlatSat`; `nil` (default) means phoenixd's own
+      node policy is the only bound. Callers holding a user-facing
+      reserve MUST set this to that reserve — without it, the caller
+      absorbs the difference silently on any route worse than the
+      estimate.
     - `:max_attempts` - Maximum retry attempts (default: 3)
   """
   @spec new(keyword()) :: t()

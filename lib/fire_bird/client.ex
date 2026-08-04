@@ -17,9 +17,19 @@ defmodule FireBird.Client do
   @callback create_invoice(config(), pos_integer(), String.t()) ::
               {:ok, map()} | {:error, term()}
 
-  @doc "Pays a BOLT11 invoice and returns the raw API response."
-  @callback pay_invoice(config(), bolt11(), pos_integer(), String.t()) ::
-              {:ok, map()} | {:error, term()}
+  @doc """
+  Pays a BOLT11 invoice and returns the raw API response. The 5th
+  argument is a flat routing-fee cap in sats forwarded as phoenixd's
+  `maxFeeFlatSat`; `nil` disables the flat cap and falls back to
+  phoenixd's own node policy (which is not user-visible from here).
+  """
+  @callback pay_invoice(
+              config(),
+              bolt11(),
+              pos_integer(),
+              String.t(),
+              non_neg_integer() | nil
+            ) :: {:ok, map()} | {:error, term()}
 
   @doc "Returns the current node balance in satoshis."
   @callback get_balance(config()) :: {:ok, map()} | {:error, term()}

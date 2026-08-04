@@ -7,9 +7,9 @@ defmodule FireBird.ClientTest do
       assert {:create_invoice, 3} in callbacks
     end
 
-    test "defines pay_invoice/4" do
+    test "defines pay_invoice/5" do
       callbacks = FireBird.Client.behaviour_info(:callbacks)
-      assert {:pay_invoice, 4} in callbacks
+      assert {:pay_invoice, 5} in callbacks
     end
 
     test "defines get_balance/1" do

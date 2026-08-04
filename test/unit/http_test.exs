@@ -153,7 +153,7 @@ defmodule FireBird.HTTPTest do
       assert {:ok, _resp} = HTTP.create_invoice(config, 1000, long_desc)
     end
 
-    test "pay_invoice/4 sends POST with invoice and amount",
+    test "pay_invoice/5 sends POST with invoice and amount (no fee cap)",
          %{bypass: bypass, config: config} do
       Bypass.expect_once(bypass, "POST", "/payinvoice", fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -162,11 +162,28 @@ defmodule FireBird.HTTPTest do
         assert params["amountSat"] == "500"
         assert params["description"] == "payment"
 
+        refute Map.has_key?(params, "maxFeeFlatSat"),
+               "nil fee_limit_sats must omit the key entirely — phoenixd rejects any non-zero routed payment against maxFeeFlatSat=0"
+
         Plug.Conn.resp(conn, 200, Jason.encode!(%{"preimage" => "aa", "fees" => 1}))
       end)
 
       assert {:ok, %{"preimage" => "aa"}} =
-               HTTP.pay_invoice(config, "lnbc100n1...", 500, "payment")
+               HTTP.pay_invoice(config, "lnbc100n1...", 500, "payment", nil)
+    end
+
+    test "pay_invoice/5 forwards fee_limit_sats as maxFeeFlatSat",
+         %{bypass: bypass, config: config} do
+      Bypass.expect_once(bypass, "POST", "/payinvoice", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = URI.decode_query(body)
+        assert params["maxFeeFlatSat"] == "42"
+
+        Plug.Conn.resp(conn, 200, Jason.encode!(%{"preimage" => "aa", "fees" => 1}))
+      end)
+
+      assert {:ok, _resp} =
+               HTTP.pay_invoice(config, "lnbc100n1...", 500, "payment", 42)
     end
 
     test "get_balance/1 sends GET to /getbalance", %{bypass: bypass, config: config} do

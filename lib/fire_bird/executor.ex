@@ -330,7 +330,8 @@ defmodule FireBird.Executor do
               state.client_config,
               in_flight.bolt11,
               in_flight.amount_sats,
-              in_flight.description || ""
+              in_flight.description || "",
+              in_flight.fee_limit_sats
             )
           end)
 

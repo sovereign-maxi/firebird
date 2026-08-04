@@ -59,17 +59,25 @@ defmodule FireBird.HTTP do
   end
 
   @impl FireBird.Client
-  def pay_invoice(%__MODULE__{} = config, bolt11, amount_sats, description)
-      when is_binary(bolt11) and is_integer(amount_sats) and amount_sats > 0 do
-    body =
-      URI.encode_query(%{
-        "invoice" => bolt11,
-        "amountSat" => amount_sats,
-        "description" => sanitize_description(description)
-      })
+  def pay_invoice(%__MODULE__{} = config, bolt11, amount_sats, description, fee_limit_sats)
+      when is_binary(bolt11) and is_integer(amount_sats) and amount_sats > 0 and
+             (is_nil(fee_limit_sats) or (is_integer(fee_limit_sats) and fee_limit_sats >= 0)) do
+    base_params = %{
+      "invoice" => bolt11,
+      "amountSat" => amount_sats,
+      "description" => sanitize_description(description)
+    }
 
-    post(config, "/payinvoice", body)
+    post(config, "/payinvoice", URI.encode_query(maybe_put_fee_cap(base_params, fee_limit_sats)))
   end
+
+  # phoenixd's `maxFeeFlatSat` is optional; omit the key entirely when
+  # the caller passes nil so we don't accidentally cap at 0 (which
+  # phoenixd rejects any nonzero-routed payment against).
+  defp maybe_put_fee_cap(params, nil), do: params
+
+  defp maybe_put_fee_cap(params, sats) when is_integer(sats) and sats >= 0,
+    do: Map.put(params, "maxFeeFlatSat", sats)
 
   @impl FireBird.Client
   def get_balance(%__MODULE__{} = config) do

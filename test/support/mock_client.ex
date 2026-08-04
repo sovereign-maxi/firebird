@@ -41,8 +41,8 @@ defmodule FireBird.MockClient do
   end
 
   @impl FireBird.Client
-  def pay_invoice(agent, bolt11, amount_sats, description) do
-    record_call(agent, :pay_invoice, {bolt11, amount_sats, description})
+  def pay_invoice(agent, bolt11, amount_sats, description, fee_limit_sats) do
+    record_call(agent, :pay_invoice, {bolt11, amount_sats, description, fee_limit_sats})
     get_response(agent, :pay_invoice)
   end
 
