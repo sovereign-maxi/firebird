@@ -122,7 +122,8 @@ defmodule FireBird.HTTPTest do
         Plug.Conn.resp(conn, 200, Jason.encode!(%{"paymentHash" => "abc", "serialized" => "lnbc"}))
       end)
 
-      assert {:ok, %{"paymentHash" => "abc"}} = HTTP.create_invoice(config, 1000, "test invoice", nil)
+      assert {:ok, %{"paymentHash" => "abc"}} =
+               HTTP.create_invoice(config, 1000, "test invoice", nil)
     end
 
     test "create_invoice/3 preserves non-ASCII Unicode in descriptions",
