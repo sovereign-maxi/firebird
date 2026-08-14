@@ -201,12 +201,15 @@ defmodule FireBird.MonitorTest do
       assert Process.alive?(ctx.pid)
     end
 
-    test "handles decimal string via partial parse", ctx do
+    test "rejects decimal strings (strict parse, no partial consumption)", ctx do
       MockClient.set_response(ctx.client, :get_info, {:ok, %{"balanceSat" => "123.45"}})
       send(ctx.pid, :poll)
       :sys.get_state(ctx.pid)
 
-      assert {:ok, 123} = Monitor.get_balance(ctx.table)
+      # A fractional/garbage balance string must not parse — the poll is
+      # skipped rather than trusting a truncated value.
+      assert {:error, :not_found} = Monitor.get_balance(ctx.table)
+      assert Process.alive?(ctx.pid)
     end
   end
 

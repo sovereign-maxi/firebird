@@ -224,11 +224,18 @@ defmodule FireBird.ExecutorTest do
       assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
     end
 
-    test "4xx client error publishes PaymentExhausted (definitive failure)", ctx do
+    test "4xx with no node-side payment record publishes PaymentExhausted", ctx do
       Registry.register(ctx.pubsub, :payment, [])
       payment = build_test_payment(max_attempts: 3)
 
       MockClient.set_response(ctx.client, :pay_invoice, {:error, {:http_error, 400, "Bad Request"}})
+      # The 4xx confirmation lookup finds no settled payment on the
+      # node — releasing the reservation is provably safe.
+      MockClient.set_response(
+        ctx.client,
+        :get_outgoing_payment_by_hash,
+        {:error, {:http_error, 404, "not found"}}
+      )
 
       Executor.submit(ctx.pid, payment)
 
@@ -236,6 +243,39 @@ defmodule FireBird.ExecutorTest do
       # Failed/retry ladder.
       assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 1_000
       refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 200
+    end
+
+    test "4xx but node shows payment SETTLED publishes PaymentUnknown, never releases", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(ctx.client, :pay_invoice, {:error, {:http_error, 400, "Bad Request"}})
+      # The confirmation lookup shows the invoice settled out-of-band
+      # (operator remsh, state loss + resubmit). Release = double-spend.
+      MockClient.set_response(ctx.client, :get_outgoing_payment_by_hash, {:ok, %{"isPaid" => true}})
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 200
+    end
+
+    test "4xx with pending node-side record publishes PaymentUnknown", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(ctx.client, :pay_invoice, {:error, {:http_error, 400, "Bad Request"}})
+
+      MockClient.set_response(
+        ctx.client,
+        :get_outgoing_payment_by_hash,
+        {:ok, %{"isPaid" => false, "completedAt" => nil}}
+      )
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 200
     end
   end
 
@@ -746,6 +786,342 @@ defmodule FireBird.ExecutorTest do
       send(ctx.pid, :totally_unexpected)
       :sys.get_state(ctx.pid)
       assert Process.alive?(ctx.pid)
+    end
+  end
+
+  describe "WAL write-through" do
+    test "appends the in-flight record at dispatch, before paying" do
+      n = System.unique_integer([:positive])
+      table = :"wal_wt_#{n}"
+      pubsub = :"wal_wt_pubsub_#{n}"
+      client_name = :"wal_wt_client_#{n}"
+      wal_name = :"wal_wt_agent_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+      start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+
+      # Slow client — the dispatch-time record must exist while the
+      # payment is still in flight.
+      MockClient.set_response(client_name, :pay_invoice, fn ->
+        Process.sleep(60_000)
+        {:error, :timeout}
+      end)
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             wal: {MockWAL, wal_name},
+             name: :"wal_wt_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      payment = build_test_payment()
+      assert :ok = Executor.submit(pid, payment)
+
+      assert [record] = MockWAL.entries(wal_name)
+      assert record.payment_hash == payment.payment_hash
+      assert record.status == :in_flight
+      assert record.attempt == 1
+    end
+
+    test "terminal resolution is appended (oldest first)" do
+      n = System.unique_integer([:positive])
+      table = :"wal_term_#{n}"
+      pubsub = :"wal_term_pubsub_#{n}"
+      client_name = :"wal_term_client_#{n}"
+      wal_name = :"wal_term_agent_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+      start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+
+      preimage = :crypto.strong_rand_bytes(32)
+      preimage_hex = Base.encode16(preimage, case: :lower)
+
+      MockClient.set_response(
+        client_name,
+        :pay_invoice,
+        {:ok, %{"preimage" => preimage_hex, "fees" => 1}}
+      )
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             wal: {MockWAL, wal_name},
+             name: :"wal_term_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      payment = build_test_payment()
+      assert :ok = Executor.submit(pid, payment)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :succeeded}}, Executor.lookup(table, payment.payment_hash))
+      end)
+
+      statuses = wal_name |> MockWAL.entries() |> Enum.map(& &1.status)
+      assert statuses == [:in_flight, :succeeded]
+    end
+
+    test "submit refuses when the WAL is unavailable" do
+      n = System.unique_integer([:positive])
+      table = :"wal_down_#{n}"
+      pubsub = :"wal_down_pubsub_#{n}"
+      client_name = :"wal_down_client_#{n}"
+      wal_name = :"wal_down_agent_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+      start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+
+      MockWAL.set_fail_appends(wal_name, true)
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             wal: {MockWAL, wal_name},
+             name: :"wal_down_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      payment = build_test_payment()
+      assert {:error, :wal_unavailable} = Executor.submit(pid, payment)
+      assert {:error, :not_found} = Executor.lookup(table, payment.payment_hash)
+      assert MockClient.calls(client_name, :pay_invoice) == []
+    end
+
+    test "recovery skips resolved payments, revives in-flight and retrying" do
+      n = System.unique_integer([:positive])
+      table = :"wal_rec_#{n}"
+      pubsub = :"wal_rec_pubsub_#{n}"
+      client_name = :"wal_rec_client_#{n}"
+      wal_name = :"wal_rec_agent_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+      start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+
+      resolved = build_test_payment()
+      MockWAL.append(wal_name, %{resolved | status: :in_flight, attempt: 1})
+      MockWAL.append(wal_name, %{resolved | status: :succeeded, attempt: 1})
+
+      wedged = build_test_payment()
+      MockWAL.append(wal_name, %{wedged | status: :retrying, attempt: 1})
+
+      already_unknown = build_test_payment()
+      MockWAL.append(wal_name, %{already_unknown | status: :in_flight, attempt: 1})
+      MockWAL.append(wal_name, %{already_unknown | status: :unknown, attempt: 1})
+
+      start_supervised!(
+        {Executor,
+         [
+           client: {MockClient, client_name},
+           pubsub: pubsub,
+           table_name: table,
+           max_concurrent: 10,
+           wal: {MockWAL, wal_name},
+           name: :"wal_rec_srv_#{n}"
+         ]},
+        id: {Executor, n}
+      )
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :unknown}}, Executor.lookup(table, wedged.payment_hash))
+      end)
+
+      assert {:error, :not_found} = Executor.lookup(table, resolved.payment_hash)
+      assert {:ok, %{status: :unknown}} = Executor.lookup(table, wedged.payment_hash)
+      assert {:error, :not_found} = Executor.lookup(table, already_unknown.payment_hash)
+      assert MockClient.calls(client_name, :pay_invoice) == []
+    end
+
+    test "terminate persists :retrying payments" do
+      n = System.unique_integer([:positive])
+      table = :"wal_retry_#{n}"
+      pubsub = :"wal_retry_pubsub_#{n}"
+      client_name = :"wal_retry_client_#{n}"
+      wal_name = :"wal_retry_agent_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+      start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+
+      MockClient.set_response(
+        client_name,
+        :pay_invoice,
+        {:error, {:phoenixd_error, :route_not_found, "no route"}}
+      )
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             wal: {MockWAL, wal_name},
+             name: :"wal_retry_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      payment = build_test_payment()
+      assert :ok = Executor.submit(pid, payment)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :retrying}}, Executor.lookup(table, payment.payment_hash))
+      end)
+
+      GenServer.stop(pid, :normal)
+
+      last = wal_name |> MockWAL.entries() |> List.last()
+      assert last.payment_hash == payment.payment_hash
+      assert last.status == :retrying
+    end
+  end
+
+  describe "ambiguous success responses" do
+    test "success response without a preimage marks the payment :unknown" do
+      n = System.unique_integer([:positive])
+      table = :"ambig_#{n}"
+      pubsub = :"ambig_pubsub_#{n}"
+      client_name = :"ambig_client_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+
+      MockClient.set_response(client_name, :pay_invoice, {:ok, %{"paymentId" => "phx_1"}})
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             name: :"ambig_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      Registry.register(pubsub, :payment, [])
+
+      payment = build_test_payment()
+      assert :ok = Executor.submit(pid, payment)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :unknown}}, Executor.lookup(table, payment.payment_hash))
+      end)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{payment_hash: ph}}
+                     when ph == payment.payment_hash
+    end
+
+    test "non-map success response marks the payment :unknown" do
+      n = System.unique_integer([:positive])
+      table = :"ambig2_#{n}"
+      pubsub = :"ambig2_pubsub_#{n}"
+      client_name = :"ambig2_client_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+
+      MockClient.set_response(client_name, :pay_invoice, {:ok, "garbage"})
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             name: :"ambig2_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      payment = build_test_payment()
+      assert :ok = Executor.submit(pid, payment)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :unknown}}, Executor.lookup(table, payment.payment_hash))
+      end)
+    end
+  end
+
+  describe "terminal cleanup of failed payments" do
+    test "cleans up definitively-failed payments after retention period" do
+      n = System.unique_integer([:positive])
+      table = :"pay_failed_cleanup_#{n}"
+      pubsub = :"pay_failed_cleanup_pubsub_#{n}"
+      client_name = :"pay_failed_cleanup_client_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, n})
+
+      MockClient.set_response(
+        client_name,
+        :pay_invoice,
+        {:error, {:http_error, 400, "bad invoice"}}
+      )
+
+      # 4xx outcomes are confirmed against the node before release:
+      # a 404 on the lookup means no payment record — definitive.
+      MockClient.set_response(
+        client_name,
+        :get_outgoing_payment_by_hash,
+        {:error, {:http_error, 404, "not found"}}
+      )
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             retention_ms: 1,
+             cleanup_interval: 600_000,
+             name: :"pay_failed_cleanup_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      payment = build_test_payment()
+      Executor.submit(pid, payment)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :failed}}, Executor.lookup(table, payment.payment_hash))
+      end)
+
+      Process.sleep(10)
+      send(pid, :cleanup)
+      :sys.get_state(pid)
+
+      assert {:error, :not_found} = Executor.lookup(table, payment.payment_hash)
     end
   end
 

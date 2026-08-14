@@ -26,7 +26,6 @@ defmodule FireBird.Webhook do
 
   require Logger
 
-  plug(:rate_limit)
   plug(:match)
   plug(:dispatch)
 
@@ -63,19 +62,27 @@ defmodule FireBird.Webhook do
 
     with {:ok, body, conn} <- Plug.Conn.read_body(conn, length: 10_000),
          :ok <- verify_signature(body, conn, opts.webhook_secret),
-         {:ok, payload} <- Jason.decode(body),
-         :ok <- check_dedup(payload, opts.dedup_table) do
+         :ok <- rate_limit(conn),
+         {:ok, payload} <- Jason.decode(body) do
+      # Handle BEFORE recording the dedup marker: handling is an
+      # idempotent re-poll trigger, so a crash between the two loses
+      # nothing — the redelivery simply re-triggers the poll. The old
+      # order (dedup first) could swallow a delivery until the slow
+      # poll sweep noticed.
       handle_payment_received(payload, opts)
-      :telemetry.execute([:fire_bird, :webhook, :received], %{count: 1}, %{status: :ok})
-      send_resp(conn, 200, "ok")
+      status = record_dedup(payload, opts.dedup_table)
+      :telemetry.execute([:fire_bird, :webhook, :received], %{count: 1}, %{status: status})
+
+      if status == :duplicate,
+        do: send_resp(conn, 200, "already processed"),
+        else: send_resp(conn, 200, "ok")
     else
       {:error, :invalid_signature} ->
         :telemetry.execute([:fire_bird, :webhook, :received], %{count: 1}, %{status: :invalid_sig})
         send_resp(conn, 401, "invalid signature")
 
-      {:error, :duplicate} ->
-        :telemetry.execute([:fire_bird, :webhook, :received], %{count: 1}, %{status: :duplicate})
-        send_resp(conn, 200, "already processed")
+      {:error, :rate_limited} ->
+        send_resp(conn, 429, "rate limit exceeded")
 
       {:more, _partial, _conn} ->
         :telemetry.execute([:fire_bird, :webhook, :received], %{count: 1}, %{status: :too_large})
@@ -92,7 +99,11 @@ defmodule FireBird.Webhook do
     send_resp(conn, 404, "not found")
   end
 
-  defp rate_limit(conn, _plug_opts) do
+  # Runs AFTER HMAC verification, inside the route: behind Tor every
+  # request arrives from 127.0.0.1, so the per-IP bucket is effectively
+  # global. Bad-signature junk must not burn the bucket and 429
+  # legitimate phoenixd callbacks.
+  defp rate_limit(conn) do
     opts = conn.private[:fire_bird_opts]
     table = opts.rate_limit_table
     max = opts.rate_limit_max
@@ -108,24 +119,21 @@ defmodule FireBird.Webhook do
       [{^key, _count, window_start}] when now - window_start >= window_ms ->
         # Window expired — reset (small race on reset is acceptable: ≤1 extra request)
         :ets.insert(table, {key, 1, now})
-        conn
+        :ok
 
       _active_window ->
         if new_count > max do
           :telemetry.execute([:fire_bird, :webhook, :rate_limited], %{count: 1}, %{})
-
-          conn
-          |> send_resp(429, "rate limit exceeded")
-          |> halt()
+          {:error, :rate_limited}
         else
-          conn
+          :ok
         end
     end
   rescue
     ArgumentError ->
       Logger.warning("Webhook: rate limit table missing, recreating")
       ensure_ets_table(conn.private[:fire_bird_opts].rate_limit_table)
-      conn
+      :ok
   end
 
   defp verify_signature(body, conn, secret) do
@@ -144,12 +152,10 @@ defmodule FireBird.Webhook do
     end
   end
 
-  defp check_dedup(%{"paymentHash" => hash}, table) when is_binary(hash) do
-    if :ets.insert_new(table, {hash, System.monotonic_time(:millisecond)}) do
-      :ok
-    else
-      {:error, :duplicate}
-    end
+  defp record_dedup(%{"paymentHash" => hash}, table) when is_binary(hash) do
+    if :ets.insert_new(table, {hash, System.monotonic_time(:millisecond)}),
+      do: :ok,
+      else: :duplicate
   rescue
     ArgumentError ->
       Logger.warning("Webhook: dedup table missing, recreating")
@@ -157,7 +163,7 @@ defmodule FireBird.Webhook do
       :ok
   end
 
-  defp check_dedup(_payload, _table), do: :ok
+  defp record_dedup(_payload, _table), do: :ok
 
   defp handle_payment_received(%{"paymentHash" => hash_hex} = _payload, opts) do
     case Base.decode16(hash_hex, case: :mixed) do

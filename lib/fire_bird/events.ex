@@ -7,7 +7,7 @@ defmodule FireBird.Events do
   ## Topics
 
   - `:invoice` — `InvoicePaid`, `InvoiceExpired`
-  - `:payment` — `PaymentSent`, `PaymentFailed`, `PaymentExhausted`
+  - `:payment` — `PaymentSent`, `PaymentFailed`, `PaymentExhausted`, `PaymentUnknown`
   - `:liquidity` — `LiquidityLow`, `LiquidityCritical`, `LiquidityRecovered`
   """
 

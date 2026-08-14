@@ -138,8 +138,10 @@ defmodule FireBird.Executor do
         {:reply, {:error, {:duplicate, duplicate_reason}}, state}
 
       true ->
-        state = execute_payment(state, payment)
-        {:reply, :ok, state}
+        case execute_payment(state, payment) do
+          {:ok, state} -> {:reply, :ok, state}
+          {:error, reason, state} -> {:reply, {:error, reason}, state}
+        end
     end
   end
 
@@ -197,8 +199,16 @@ defmodule FireBird.Executor do
 
     case :ets.lookup(state.table_name, payment_hash) do
       [{^payment_hash, %Payment{} = payment}] when payment.status == :retrying ->
-        state = execute_payment(state, payment)
-        {:noreply, state}
+        case execute_payment(state, payment) do
+          {:ok, state} ->
+            {:noreply, state}
+
+          {:error, _wal_reason, state} ->
+            # Can't pay durably while the WAL is down — fail closed to
+            # :unknown so the caller reconciles instead of the payment
+            # wedging in :retrying with no timer left.
+            {:noreply, handle_unknown_outcome(state, payment, "wal_unavailable_on_retry")}
+        end
 
       _other ->
         {:noreply, state}
@@ -235,7 +245,9 @@ defmodule FireBird.Executor do
         state.table_name
         |> :ets.tab2list()
         |> Enum.each(fn {_hash, payment} ->
-          if payment.status == :in_flight do
+          # Persist anything still unresolved — :retrying included, since
+          # its pending retry timer does not survive the restart.
+          if payment.status in [:in_flight, :retrying] do
             wal_mod.append(wal_config, payment)
           end
         end)
@@ -256,7 +268,18 @@ defmodule FireBird.Executor do
   defp recover_from_wal({wal_mod, wal_config}, table_name, pubsub) do
     case wal_mod.recover(wal_config) do
       {:ok, payments} when is_list(payments) ->
-        count = length(payments)
+        # Last record per payment_hash wins (recover/1 returns append
+        # order, oldest first). Payments whose final record is terminal
+        # (:succeeded / :exhausted / :failed) or already fail-closed
+        # (:unknown) are resolved — only :in_flight / :retrying revive.
+        revivable =
+          payments
+          |> Enum.filter(&match?(%Payment{}, &1))
+          |> Enum.group_by(& &1.payment_hash)
+          |> Enum.map(fn {_hash, records} -> List.last(records) end)
+          |> Enum.filter(&(&1.status in [:in_flight, :retrying]))
+
+        count = length(revivable)
 
         if count > 0 do
           Logger.warning(
@@ -265,7 +288,7 @@ defmodule FireBird.Executor do
           )
         end
 
-        Enum.each(payments, fn payment -> recover_single(payment, table_name, pubsub) end)
+        Enum.each(revivable, fn payment -> recover_single(payment, table_name, pubsub) end)
 
         # No retry timers: recovered payments are ambiguous by
         # definition (the VM crashed while the phoenixd task was in
@@ -322,29 +345,69 @@ defmodule FireBird.Executor do
   defp execute_payment(state, payment) do
     case Payment.mark_in_flight(payment) do
       {:ok, in_flight} ->
-        :ets.insert(state.table_name, {payment.payment_hash, in_flight})
+        # The WAL record lands BEFORE the task starts — a hard crash
+        # after this point is always recoverable. If the WAL is down,
+        # refuse to pay: an undurably-dispatched payment is the
+        # double-pay / lost-settlement path.
+        case wal_append(state.wal, in_flight) do
+          :ok ->
+            :ets.insert(state.table_name, {payment.payment_hash, in_flight})
 
-        task =
-          Task.async(fn ->
-            state.client_mod.pay_invoice(
-              state.client_config,
-              in_flight.bolt11,
-              in_flight.amount_sats,
-              in_flight.description || "",
-              in_flight.fee_limit_sats
+            task =
+              Task.async(fn ->
+                state.client_mod.pay_invoice(
+                  state.client_config,
+                  in_flight.bolt11,
+                  in_flight.amount_sats,
+                  in_flight.description || "",
+                  in_flight.fee_limit_sats
+                )
+              end)
+
+            :telemetry.execute(
+              [:fire_bird, :payment, :submitted],
+              %{count: 1},
+              %{amount_sats: payment.amount_sats}
             )
-          end)
 
-        :telemetry.execute(
-          [:fire_bird, :payment, :submitted],
-          %{count: 1},
-          %{amount_sats: payment.amount_sats}
-        )
+            {:ok, %{state | tasks: Map.put(state.tasks, task.ref, payment.payment_hash)}}
 
-        %{state | tasks: Map.put(state.tasks, task.ref, payment.payment_hash)}
+          {:error, reason} ->
+            Logger.error(
+              "Executor: refusing to dispatch payment — WAL append failed: #{inspect(reason)}"
+            )
+
+            {:error, :wal_unavailable, state}
+        end
 
       {:error, _reason} ->
-        state
+        {:ok, state}
+    end
+  end
+
+  # Crash-durability gate for dispatch. Returns :ok when no WAL is
+  # configured (the init warning already covers that choice).
+  defp wal_append(nil, _payment), do: :ok
+
+  defp wal_append({wal_mod, wal_config}, payment) do
+    case wal_mod.append(wal_config, payment) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Executor: WAL append failed: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  # Best-effort transition logging: the payment is already resolved on
+  # Lightning by the time this runs, so a WAL failure cannot block the
+  # bookkeeping — it only means a crash would recover this payment as
+  # :unknown (fail-closed).
+  defp wal_log(state, payment) do
+    case wal_append(state.wal, payment) do
+      :ok -> :ok
+      {:error, _reason} -> :ok
     end
   end
 
@@ -366,13 +429,28 @@ defmodule FireBird.Executor do
     if is_binary(preimage_hex) and preimage_hex != "" do
       process_preimage(state, payment, preimage_hex, fee_raw, phoenixd_id)
     else
+      # A 2xx without a preimage is not proof of payment, and leaving
+      # the payment :in_flight would wedge it forever — no task remains,
+      # nothing re-polls, and the dedup gate blocks resubmission. The
+      # payment may have settled; force reconciliation instead.
       Logger.warning(
         "Executor: success response missing preimage for " <>
           Base.encode16(payment.payment_hash, case: :lower) <>
-          " — keys: #{inspect(Map.keys(resp))}"
+          " — keys: #{inspect(Map.keys(resp))} — marking :unknown"
       )
 
-      state
+      handle_unknown_outcome(state, payment, :missing_preimage_in_success_response)
+    end
+  end
+
+  # 4xx errors get a node-side confirmation before classification:
+  # "already paid" must never release, everything else may. 408/429
+  # stay hard-:unknown — the node may still be processing.
+  defp process_result(state, payment, {:error, {:http_error, status, _body} = reason})
+       when status >= 400 and status < 500 and status not in [408, 429] do
+    case confirm_4xx_outcome(state, payment) do
+      :definitive -> handle_definitive_failure(state, payment, reason)
+      :unknown -> handle_unknown_outcome(state, payment, reason)
     end
   end
 
@@ -390,13 +468,51 @@ defmodule FireBird.Executor do
   end
 
   defp process_result(state, payment, {:ok, unexpected}) do
+    # Same wedge risk as a missing preimage: nothing will drive this
+    # payment forward again. Mark :unknown so the caller reconciles.
     Logger.warning(
       "Executor: unexpected success response for " <>
         Base.encode16(payment.payment_hash, case: :lower) <>
-        " — #{inspect(unexpected)}"
+        " — #{inspect(unexpected)} — marking :unknown"
     )
 
-    state
+    handle_unknown_outcome(state, payment, :unexpected_success_response)
+  end
+
+  # A 4xx from /payinvoice usually means the payment was never
+  # attempted (bad invoice, unsupported network). But it can also
+  # surface when the invoice was ALREADY settled — an out-of-band
+  # payment, an operator remsh, or executor state loss followed by a
+  # resubmit. The dedup gate cannot see those, and releasing a settled
+  # payment's reservation is the double-spend path. Ask the node:
+  # release only when it positively shows no settled payment exists.
+  defp confirm_4xx_outcome(state, payment) do
+    hash = payment.ln_payment_hash || payment.payment_hash
+
+    case state.client_mod.get_outgoing_payment_by_hash(state.client_config, hash) do
+      {:ok, %{"isPaid" => true}} ->
+        Logger.error(
+          "Executor: 4xx response but node shows payment SETTLED — " <>
+            "marking :unknown for reconciliation"
+        )
+
+        :unknown
+
+      {:ok, %{"completedAt" => completed_at}}
+      when is_binary(completed_at) or is_integer(completed_at) ->
+        # Terminal failure record on the node — provably not settled.
+        :definitive
+
+      {:ok, _still_pending} ->
+        :unknown
+
+      {:error, {:http_error, 404, _body}} ->
+        # No outgoing record at all — the payment was never attempted.
+        :definitive
+
+      {:error, _lookup_failure} ->
+        :unknown
+    end
   end
 
   # Classifies an executor error into one of three buckets:
@@ -414,7 +530,19 @@ defmodule FireBird.Executor do
   # falls through to :unknown so the caller must reconcile before
   # releasing — a Finch timeout on a payment that later settles must
   # never trigger a release, because that's the double-spend path.
+  @spec classify_error(term()) :: :retryable | :definitive | :unknown
   defp classify_error({:task_crash, _reason}), do: :unknown
+  defp classify_error(%{__exception__: true, __struct__: Mint.TransportError}), do: :unknown
+  defp classify_error({:http_error, status, _body}) when status >= 500, do: :unknown
+  defp classify_error({:http_error, 408, _body}), do: :unknown
+  defp classify_error({:http_error, 429, _body}), do: :unknown
+  defp classify_error(:timeout), do: :unknown
+  defp classify_error({:timeout, _reason}), do: :unknown
+
+  # Circuit-breaker rejections happen before any bytes left the VM —
+  # the node provably never saw the payment, so release is safe.
+  defp classify_error(:circuit_open), do: :definitive
+  defp classify_error(:breaker_unavailable), do: :definitive
   defp classify_error(%{__exception__: true, __struct__: Mint.TransportError}), do: :unknown
   defp classify_error({:http_error, status, _body}) when status >= 500, do: :unknown
   defp classify_error({:http_error, 408, _body}), do: :unknown
@@ -427,15 +555,9 @@ defmodule FireBird.Executor do
     :retryable
   end
 
-  defp classify_error({:http_error, status, _body}) when status >= 400 and status < 500 do
-    # 4xx from phoenixd on /payinvoice generally names a permanent
-    # problem (bad invoice, unsupported network, invoice already
-    # paid). We treat as definitive so the caller may release —
-    # phoenixd's own idempotent behaviour (rejecting a second
-    # /payinvoice for a payment it already settled) is handled by
-    # the submit-side dedup gate.
-    :definitive
-  end
+  # 4xx responses never reach this function — process_result/3 routes
+  # them through confirm_4xx_outcome/2 first, because a bare 4xx can
+  # mean "already paid" and must never auto-release.
 
   defp classify_error(_other), do: :unknown
 
@@ -444,6 +566,7 @@ defmodule FireBird.Executor do
 
     case Payment.mark_failed(payment, reason_str) do
       {:ok, %Payment{status: :retrying} = retrying} ->
+        wal_log(state, retrying)
         :ets.insert(state.table_name, {payment.payment_hash, retrying})
 
         PubSub.publish(state.pubsub, :payment, %PaymentFailed{
@@ -464,6 +587,7 @@ defmodule FireBird.Executor do
         %{state | retry_timers: Map.put(state.retry_timers, payment.payment_hash, timer_ref)}
 
       {:ok, %Payment{status: :exhausted} = exhausted} ->
+        wal_log(state, exhausted)
         :ets.insert(state.table_name, {payment.payment_hash, exhausted})
 
         PubSub.publish(state.pubsub, :payment, %PaymentExhausted{
@@ -491,6 +615,7 @@ defmodule FireBird.Executor do
 
     case Payment.mark_definitively_failed(payment, reason_str) do
       {:ok, failed} ->
+        wal_log(state, failed)
         :ets.insert(state.table_name, {payment.payment_hash, failed})
 
         # Publish as PaymentExhausted so downstream release-on-failed
@@ -521,6 +646,7 @@ defmodule FireBird.Executor do
 
     case Payment.mark_unknown(payment, reason_str) do
       {:ok, unknown} ->
+        wal_log(state, unknown)
         :ets.insert(state.table_name, {payment.payment_hash, unknown})
 
         PubSub.publish(state.pubsub, :payment, %PaymentUnknown{
@@ -564,6 +690,7 @@ defmodule FireBird.Executor do
   defp apply_preimage(state, payment, preimage, fee_sats, phoenixd_id) do
     case Payment.mark_succeeded(payment, preimage, fee_sats, phoenixd_id) do
       {:ok, succeeded} ->
+        wal_log(state, succeeded)
         :ets.insert(state.table_name, {payment.payment_hash, succeeded})
 
         PubSub.publish(state.pubsub, :payment, %PaymentSent{
@@ -598,8 +725,11 @@ defmodule FireBird.Executor do
 
     succeeded = :ets.match_object(state.table_name, {:_, %{status: :succeeded}})
     exhausted = :ets.match_object(state.table_name, {:_, %{status: :exhausted}})
+    failed = :ets.match_object(state.table_name, {:_, %{status: :failed}})
 
-    Enum.reduce(succeeded ++ exhausted, 0, fn {key, payment}, count ->
+    # :unknown is deliberately never swept — it holds the dedup lock
+    # until the caller reconciles with the node.
+    Enum.reduce(succeeded ++ exhausted ++ failed, 0, fn {key, payment}, count ->
       if terminal_and_expired?(payment, now, state.retention_ms) do
         :ets.delete(state.table_name, key)
         count + 1
@@ -614,7 +744,7 @@ defmodule FireBird.Executor do
          now,
          retention_ms
        )
-       when status in [:succeeded, :exhausted] and is_struct(completed_at, DateTime) do
+       when status in [:succeeded, :exhausted, :failed] and is_struct(completed_at, DateTime) do
     DateTime.diff(now, completed_at, :millisecond) > retention_ms
   end
 

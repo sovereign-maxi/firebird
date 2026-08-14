@@ -168,10 +168,17 @@ defmodule FireBird.Manager do
   end
 
   defp check_invoice(state, invoice) do
-    if Invoice.expired?(invoice) do
-      expire_invoice(state, invoice)
-    else
-      poll_payment_status(state, invoice)
+    # Poll first: a payment settling in the final window before expiry
+    # must be confirmed — expiring first would strand a paid invoice.
+    poll_payment_status(state, invoice)
+
+    # Re-read: the poll may have just confirmed the payment.
+    case :ets.lookup(state.table_name, invoice.payment_hash) do
+      [{_key, %Invoice{status: :pending} = current}] ->
+        if Invoice.expired?(current), do: expire_invoice(state, current)
+
+      _other ->
+        :ok
     end
   end
 

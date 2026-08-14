@@ -12,8 +12,9 @@ defmodule FireBird.Payment do
   Lightning is genuinely undetermined — the mint MUST NOT release the
   caller's reservation until it has reconciled with the node. `:failed`
   is reserved for explicit "payment definitively did not happen"
-  signals (structured phoenixd errors, 4xx responses that name a
-  reason).
+  signals (structured phoenixd errors, or a 4xx that the executor has
+  node-side CONFIRMED shows no settled payment — see `confirm_4xx_outcome`
+  in `FireBird.Executor`).
 
   Tracks Lightning payments through their lifecycle with exponential
   backoff retry logic (max 3 attempts on `:retrying`; never on

@@ -78,6 +78,36 @@ defmodule FireBird.ManagerTest do
       assert updated.status == :expired
     end
 
+    test "expired-but-paid invoice is confirmed, not expired (poll before expire)", ctx do
+      preimage = :crypto.strong_rand_bytes(32)
+      payment_hash = :crypto.hash(:sha256, preimage)
+      preimage_hex = Base.encode16(preimage, case: :lower)
+
+      invoice =
+        build_test_invoice(
+          payment_hash: payment_hash,
+          expires_at: DateTime.add(DateTime.utc_now(), -1, :second)
+        )
+
+      Manager.track(ctx.pid, invoice)
+      Registry.register(ctx.pubsub, :invoice, [])
+
+      MockClient.set_response(
+        ctx.client,
+        :get_incoming_payment,
+        {:ok, %{"isPaid" => true, "preimage" => preimage_hex, "receivedSat" => 1_000}}
+      )
+
+      send(ctx.pid, :poll)
+      :sys.get_state(ctx.pid)
+
+      assert_receive {FireBird.PubSub, :invoice,
+                      %FireBird.Events.InvoicePaid{payment_hash: ^payment_hash}}
+
+      assert {:ok, updated} = Manager.lookup(ctx.table, payment_hash)
+      assert updated.status == :paid
+    end
+
     test "paid invoice publishes InvoicePaid and updates ETS", ctx do
       preimage = :crypto.strong_rand_bytes(32)
       payment_hash = :crypto.hash(:sha256, preimage)

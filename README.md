@@ -2,6 +2,8 @@
 
 Lightning Network integration via the Phoenixd daemon REST API. Manages invoices, outbound payments, and liquidity monitoring.
 
+Source: [github.com/sovereign-maxi/firebird](https://github.com/sovereign-maxi/firebird)
+
 ## Installation
 
 Add `fire_bird` to your dependencies in `mix.exs`:
@@ -347,4 +349,4 @@ end
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

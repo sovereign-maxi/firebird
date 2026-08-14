@@ -1,7 +1,7 @@
 defmodule FireBird.PubSubTest do
   use ExUnit.Case, async: true
 
-  alias FireBird.Events.{InvoicePaid, LiquidityLow, PaymentSent}
+  alias FireBird.Events.{InvoicePaid, LiquidityLow, PaymentSent, PaymentUnknown}
   alias FireBird.PubSub
 
   setup do
@@ -88,6 +88,15 @@ defmodule FireBird.PubSubTest do
                amount_sats: 0,
                fee_sats: 0,
                preimage: <<>>
+             }) == :payment
+    end
+
+    test "maps PaymentUnknown to :payment" do
+      assert PubSub.topic_for_event(%PaymentUnknown{
+               payment_hash: <<>>,
+               amount_sats: 0,
+               reason: "timeout",
+               attempt: 1
              }) == :payment
     end
 

@@ -25,6 +25,12 @@ defmodule FireBird.UtilTest do
       assert :error = Util.parse_integer("")
     end
 
+    test "rejects strings with trailing content (full consumption required)" do
+      assert :error = Util.parse_integer("123.45")
+      assert :error = Util.parse_integer("42abc")
+      assert :error = Util.parse_integer("100 sats")
+    end
+
     test "returns error for unsupported types" do
       assert :error = Util.parse_integer(nil)
       assert :error = Util.parse_integer(:atom)

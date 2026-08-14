@@ -34,7 +34,8 @@ defmodule FireBird.PubSub do
     LiquidityRecovered,
     PaymentExhausted,
     PaymentFailed,
-    PaymentSent
+    PaymentSent,
+    PaymentUnknown
   }
 
   @doc "Returns a child spec for the PubSub registry."
@@ -71,6 +72,7 @@ defmodule FireBird.PubSub do
   def topic_for_event(%PaymentSent{}), do: :payment
   def topic_for_event(%PaymentFailed{}), do: :payment
   def topic_for_event(%PaymentExhausted{}), do: :payment
+  def topic_for_event(%PaymentUnknown{}), do: :payment
   def topic_for_event(%LiquidityLow{}), do: :liquidity
   def topic_for_event(%LiquidityCritical{}), do: :liquidity
   def topic_for_event(%LiquidityRecovered{}), do: :liquidity

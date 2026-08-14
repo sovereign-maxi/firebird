@@ -13,8 +13,8 @@ defmodule FireBird.Util do
 
   def parse_integer(val) when is_binary(val) do
     case Integer.parse(val) do
-      {int, _rest} -> {:ok, int}
-      :error -> :error
+      {int, ""} -> {:ok, int}
+      _trailing_garbage -> :error
     end
   end
 
