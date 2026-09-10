@@ -1125,6 +1125,72 @@ defmodule FireBird.ExecutorTest do
     end
   end
 
+  describe "push payments — :offer destination" do
+    test "dispatches to pay_offer and stores in ETS as succeeded", ctx do
+      payment = build_offer_payment()
+      preimage = :crypto.strong_rand_bytes(32)
+      preimage_hex = Base.encode16(preimage, case: :lower)
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_offer,
+        {:ok, %{"preimage" => preimage_hex, "fees" => 10}}
+      )
+
+      assert :ok = Executor.submit(ctx.pid, payment)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?(
+          {:ok, %{status: :succeeded}},
+          Executor.lookup(ctx.table, payment.payment_hash)
+        )
+      end)
+
+      # Recorded call arrives with the offer string as the first arg,
+      # not a bolt11 — this is the destination-dispatch invariant.
+      calls = MockClient.calls(ctx.client, :pay_offer)
+      assert length(calls) == 1
+      {offer, amount, _desc, _fee_cap} = hd(calls)
+      assert offer == payment.destination
+      assert amount == payment.amount_sats
+    end
+
+    test "publishes PaymentUnknown on offer HTTP timeout — never auto-retries", ctx do
+      payment = build_offer_payment()
+
+      Registry.register(ctx.pubsub, :payment, [])
+
+      MockClient.set_response(ctx.client, :pay_offer, {:error, :timeout})
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 100
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 100
+    end
+
+    test "does NOT accept pay_offer paths through the pay_invoice client stub", ctx do
+      payment = build_offer_payment()
+      MockClient.set_response(ctx.client, :pay_invoice, {:error, :should_not_be_called})
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_offer,
+        {:ok,
+         %{"preimage" => Base.encode16(:crypto.strong_rand_bytes(32), case: :lower), "fees" => 0}}
+      )
+
+      assert :ok = Executor.submit(ctx.pid, payment)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :succeeded}}, Executor.lookup(ctx.table, payment.payment_hash))
+      end)
+
+      # pay_invoice must not have been called for this :offer submission
+      assert MockClient.calls(ctx.client, :pay_invoice) == []
+    end
+  end
+
   defp build_test_payment(opts \\ []) do
     payment_hash = Keyword.get_lazy(opts, :payment_hash, fn -> :crypto.strong_rand_bytes(32) end)
 
@@ -1133,6 +1199,26 @@ defmodule FireBird.ExecutorTest do
       bolt11: "lnbc1000u1ptest#{Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)}",
       amount_sats: Keyword.get(opts, :amount_sats, 1_000),
       created_at: DateTime.utc_now(),
+      max_attempts: Keyword.get(opts, :max_attempts, 3)
+    )
+  end
+
+  defp build_offer_payment(opts \\ []) do
+    payment_hash = Keyword.get_lazy(opts, :payment_hash, fn -> :crypto.strong_rand_bytes(32) end)
+
+    offer =
+      Keyword.get(
+        opts,
+        :offer,
+        "lno1test#{Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)}"
+      )
+
+    Payment.new(
+      payment_hash: payment_hash,
+      amount_sats: Keyword.get(opts, :amount_sats, 1_000),
+      created_at: DateTime.utc_now(),
+      destination_type: :offer,
+      destination: offer,
       max_attempts: Keyword.get(opts, :max_attempts, 3)
     )
   end

@@ -42,6 +42,48 @@ defmodule FireBird.PaymentTest do
         Payment.new(payment_hash: <<0::256>>)
       end
     end
+
+    test "defaults destination_type to :bolt11" do
+      payment =
+        Payment.new(
+          payment_hash: :crypto.strong_rand_bytes(32),
+          bolt11: "lnbc1u1pdummy",
+          amount_sats: 100,
+          created_at: DateTime.utc_now()
+        )
+
+      assert payment.destination_type == :bolt11
+      assert payment.destination == "lnbc1u1pdummy"
+    end
+
+    test "accepts :offer destination without bolt11" do
+      payment =
+        Payment.new(
+          payment_hash: :crypto.strong_rand_bytes(32),
+          amount_sats: 100,
+          created_at: DateTime.utc_now(),
+          destination_type: :offer,
+          destination: "lno1abc"
+        )
+
+      assert payment.destination_type == :offer
+      assert payment.destination == "lno1abc"
+      assert payment.bolt11 == nil
+    end
+
+    test "accepts :ln_address destination" do
+      payment =
+        Payment.new(
+          payment_hash: :crypto.strong_rand_bytes(32),
+          amount_sats: 100,
+          created_at: DateTime.utc_now(),
+          destination_type: :ln_address,
+          destination: "user@example.com"
+        )
+
+      assert payment.destination_type == :ln_address
+      assert payment.destination == "user@example.com"
+    end
   end
 
   describe "mark_in_flight/1" do

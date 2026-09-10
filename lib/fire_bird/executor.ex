@@ -303,7 +303,8 @@ defmodule FireBird.Executor do
         # No retry timers: recovered payments are ambiguous by
         # definition (the VM crashed while the phoenixd task was in
         # flight) and must be reconciled against the node before any
-        # further action, per the C1/C2 discipline.
+        # further action. Never auto-retry a payment whose Lightning
+        # outcome is undetermined — that's the double-pay path.
         %{}
 
       {:error, reason} ->
@@ -363,20 +364,11 @@ defmodule FireBird.Executor do
           :ok ->
             :ets.insert(state.table_name, {payment.payment_hash, in_flight})
 
-            task =
-              Task.async(fn ->
-                state.client_mod.pay_invoice(
-                  state.client_config,
-                  in_flight.bolt11,
-                  in_flight.amount_sats,
-                  in_flight.description || "",
-                  in_flight.fee_limit_sats
-                )
-              end)
+            task = spawn_payment_task(state, in_flight)
 
             :telemetry.execute(
               [:fire_bird, :payment, :submitted],
-              %{count: 1},
+              %{count: 1, destination_type: in_flight.destination_type},
               %{amount_sats: payment.amount_sats}
             )
 
@@ -394,6 +386,72 @@ defmodule FireBird.Executor do
         {:ok, state}
     end
   end
+
+  # Dispatches to the destination-appropriate client call. All three
+  # destination types produce the same shape of task result, and are
+  # classified through the same `process_result` / `classify_error`
+  # pipeline. Retry semantics differ per destination — that
+  # difference belongs in the caller's payment consumer;
+  # firebird's job is to submit, classify, and expose the outcome.
+  defp spawn_payment_task(state, %Payment{destination_type: :bolt11} = payment) do
+    Task.async(fn ->
+      state.client_mod.pay_invoice(
+        state.client_config,
+        payment.bolt11,
+        payment.amount_sats,
+        payment.description || "",
+        payment.fee_limit_sats
+      )
+    end)
+  end
+
+  defp spawn_payment_task(state, %Payment{destination_type: :offer} = payment) do
+    Task.async(fn ->
+      state.client_mod.pay_offer(
+        state.client_config,
+        payment.destination,
+        payment.amount_sats,
+        payment.description || "",
+        payment.fee_limit_sats
+      )
+    end)
+  end
+
+  # `:ln_address` runs a two-stage flow inside the task: fetch a
+  # bolt11 via LUD-06/LUD-16, then submit that bolt11 through the
+  # standard `pay_invoice` path. This keeps LN-address payments
+  # identical in trust model to plain bolt11 (payment hash known
+  # before we pay, preimage validation armed, retry safety via LN
+  # atomicity). Fetch failure = definitive non-attempt.
+  defp spawn_payment_task(state, %Payment{destination_type: :ln_address} = payment) do
+    Task.async(fn ->
+      case FireBird.Lnurl.fetch_invoice(
+             payment.destination,
+             payment.amount_sats,
+             lnurl_finch_name(state)
+           ) do
+        {:ok, %{bolt11: bolt11}} ->
+          state.client_mod.pay_invoice(
+            state.client_config,
+            bolt11,
+            payment.amount_sats,
+            payment.description || "",
+            payment.fee_limit_sats
+          )
+
+        {:error, reason} ->
+          {:error, {:lnurl_fetch_failed, reason}}
+      end
+    end)
+  end
+
+  # LNURL fetch runs through Finch — the same pool phoenixd HTTP uses,
+  # unless the caller overrides. Resolved by convention from
+  # `client_config` when the config is a `%FireBird.HTTP{}` struct;
+  # falls back to `:fire_bird_finch` (the default pool name from
+  # `FireBird.Supervisor`) otherwise.
+  defp lnurl_finch_name(%{client_config: %FireBird.HTTP{finch_name: name}}), do: name
+  defp lnurl_finch_name(_state), do: :fire_bird_finch
 
   # Crash-durability gate for dispatch. Returns :ok when no WAL is
   # configured (the init warning already covers that choice).

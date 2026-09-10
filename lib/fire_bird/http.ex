@@ -86,6 +86,23 @@ defmodule FireBird.HTTP do
     do: Map.put(params, "maxFeeFlatSat", sats)
 
   @impl FireBird.Client
+  def pay_offer(%__MODULE__{} = config, offer, amount_sats, description, fee_limit_sats)
+      when is_binary(offer) and is_integer(amount_sats) and amount_sats > 0 and
+             (is_nil(fee_limit_sats) or (is_integer(fee_limit_sats) and fee_limit_sats >= 0)) do
+    # NB: phoenixd endpoint + parameter names should be pre-flight
+    # verified against the target deployment. Parameters below match
+    # phoenixd's public HTTP surface as ACINQ documents them; any
+    # deviation is a one-line adjustment here.
+    base_params = %{
+      "offer" => offer,
+      "amountSat" => amount_sats,
+      "message" => sanitize_description(description)
+    }
+
+    post(config, "/payoffer", URI.encode_query(maybe_put_fee_cap(base_params, fee_limit_sats)))
+  end
+
+  @impl FireBird.Client
   def get_balance(%__MODULE__{} = config) do
     get(config, "/getbalance")
   end

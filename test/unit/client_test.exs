@@ -39,9 +39,9 @@ defmodule FireBird.ClientTest do
       assert {:send_onchain, 4} in optional
     end
 
-    test "defines exactly 8 callbacks" do
+    test "defines exactly 10 callbacks" do
       callbacks = FireBird.Client.behaviour_info(:callbacks)
-      assert length(callbacks) == 9
+      assert length(callbacks) == 10
     end
   end
 end

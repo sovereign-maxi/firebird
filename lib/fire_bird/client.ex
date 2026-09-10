@@ -12,6 +12,7 @@ defmodule FireBird.Client do
   @type config :: term()
   @type payment_hash :: binary()
   @type bolt11 :: String.t()
+  @type offer :: String.t()
 
   @doc """
   Creates a Lightning invoice and returns the raw API response. The
@@ -33,6 +34,26 @@ defmodule FireBird.Client do
   @callback pay_invoice(
               config(),
               bolt11(),
+              pos_integer(),
+              String.t(),
+              non_neg_integer() | nil
+            ) :: {:ok, map()} | {:error, term()}
+
+  @doc """
+  Pays a BOLT12 offer via phoenixd's `/payoffer` endpoint. Phoenixd
+  fetches a per-payment invoice from the offer under the hood and
+  pays it — the payment hash is only known once the response returns.
+
+  The `amount_sats` argument is the amount to pay; the offer may be
+  amount-flexible (recipient-chosen) or amount-fixed (in which case
+  the caller must match it or phoenixd rejects).
+
+  The `fee_limit_sats` argument mirrors `pay_invoice/5`: `nil`
+  disables the flat cap.
+  """
+  @callback pay_offer(
+              config(),
+              offer(),
               pos_integer(),
               String.t(),
               non_neg_integer() | nil
