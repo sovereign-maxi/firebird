@@ -65,8 +65,18 @@ defmodule FireBird.Executor do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @doc "Submits a payment for async execution."
-  @spec submit(GenServer.server(), Payment.t(), timeout()) :: :ok | {:error, :at_capacity}
+  @doc """
+  Submits a payment for async execution. Returns `:ok` on
+  acceptance, `{:error, :at_capacity}` when the max-concurrent
+  ceiling is hit, or `{:error, {:duplicate, reason}}` when a
+  payment with the same `payment_hash` already sits in a state
+  that refuses re-submission (see `@active_dedup_statuses` and
+  `@terminal_dedup_statuses`).
+  """
+  @spec submit(GenServer.server(), Payment.t(), timeout()) ::
+          :ok
+          | {:error, :at_capacity}
+          | {:error, {:duplicate, atom()}}
   def submit(server, %Payment{} = payment, timeout \\ 5_000) do
     GenServer.call(server, {:submit, payment}, timeout)
   end
