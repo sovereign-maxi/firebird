@@ -553,12 +553,6 @@ defmodule FireBird.Executor do
   # the node provably never saw the payment, so release is safe.
   defp classify_error(:circuit_open), do: :definitive
   defp classify_error(:breaker_unavailable), do: :definitive
-  defp classify_error(%{__exception__: true, __struct__: Mint.TransportError}), do: :unknown
-  defp classify_error({:http_error, status, _body}) when status >= 500, do: :unknown
-  defp classify_error({:http_error, 408, _body}), do: :unknown
-  defp classify_error({:http_error, 429, _body}), do: :unknown
-  defp classify_error(:timeout), do: :unknown
-  defp classify_error({:timeout, _reason}), do: :unknown
 
   defp classify_error({:phoenixd_error, kind, _msg})
        when kind in [:route_not_found, :insufficient_liquidity, :temporary_channel_failure] do
