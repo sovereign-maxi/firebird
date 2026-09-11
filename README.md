@@ -1,6 +1,6 @@
 # FireBird
 
-Lightning Network integration via the Phoenixd daemon REST API. Manages invoices, outbound payments, and liquidity monitoring.
+Lightning Network integration via the Phoenixd daemon REST API. Manages invoices, outbound payments (BOLT11, BOLT12 offers, LN Address / LUD-06+LUD-16), and liquidity monitoring.
 
 Source: [github.com/sovereign-maxi/firebird](https://github.com/sovereign-maxi/firebird)
 
@@ -24,7 +24,7 @@ end
 │                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
 │  │   Invoice    │  │   Payment    │  │       Events         │   │
-│  │ (state mach) │  │ (retry/exp)  │  │  (8 event structs)   │   │
+│  │ (state mach) │  │ (retry/exp)  │  │  (9 event structs)   │   │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘   │
 │                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
@@ -33,8 +33,13 @@ end
 │  └──────────────┘  └──────────────┘  └──────────────────────┘   │
 │                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │  Monitor     │  │  Manager     │  │    Executor          │   │
-│  │ (liquidity)  │  │ (invoices)   │  │   (payments)         │   │
+│  │    Lnurl     │  │  Monitor     │  │      Manager         │   │
+│  │ (LUD-06/16)  │  │ (liquidity)  │  │    (invoices)        │   │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │  Executor    │  │  Webhook     │  │      Cleaner         │   │
+│  │ (payments)   │  │ (Plug rtr)   │  │ (webhook dedup TTL)  │   │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘   │
 │                           │                                     │
 │                    ┌──────┴───────┐                             │
@@ -54,12 +59,13 @@ end
 | Module | Purpose |
 |--------|---------|
 | `FireBird.Invoice` | Invoice state machine: pending → paid \| expired |
-| `FireBird.Payment` | Payment state machine with exponential backoff retry |
-| `FireBird.Events` | 8 event structs for invoice, payment, and liquidity lifecycle |
+| `FireBird.Payment` | Payment state machine with exponential backoff retry; BOLT11 / BOLT12 offer / LN Address destinations |
+| `FireBird.Events` | 9 event structs for invoice, payment, and liquidity lifecycle |
 | `FireBird.Client` | Behaviour contract for Phoenixd API operations |
 | `FireBird.WAL` | Optional write-ahead log behaviour (append + recover) |
-| `FireBird.Bolt11` | Pure BOLT11 invoice amount parser |
+| `FireBird.Bolt11` | Pure BOLT11 invoice amount + payment-hash parser |
 | `FireBird.Fees` | Fee calculation with PPM, floor, and ceiling clamping |
+| `FireBird.Lnurl` | LUD-06 / LUD-16 (Lightning Address) resolver with SSRF hardening |
 | `FireBird.PubSub` | Registry-based event publish/subscribe |
 | `FireBird.HTTP` | Finch-based Phoenixd REST client implementing Client |
 | `FireBird.Monitor` | Periodic balance polling with threshold alerts |
@@ -103,23 +109,51 @@ Invoice.expired?(invoice)  # true/false
 ```elixir
 alias FireBird.Payment
 
-# Create a pending payment
-payment = Payment.new(
+# BOLT11 destination (legacy default)
+bolt11_payment = Payment.new(
   payment_hash: hash,
   bolt11: "lnbc1000u1p...",
+  amount_sats: 1_000,
+  created_at: DateTime.utc_now(),
+  fee_limit_sats: 25          # flat routing-fee cap forwarded to phoenixd
+)
+
+# BOLT12 offer — phoenixd fetches a per-payment invoice under the hood;
+# ln_payment_hash is bound from the /payoffer response before
+# mark_succeeded/4 accepts a preimage.
+offer_payment = Payment.new(
+  payment_hash: local_dedup_key,
+  destination_type: :offer,
+  destination: "lno1...",
   amount_sats: 1_000,
   created_at: DateTime.utc_now()
 )
 
-# Lifecycle: pending → in_flight → succeeded | retrying → exhausted
-{:ok, in_flight} = Payment.mark_in_flight(payment)
+# Lightning Address (LUD-06 / LUD-16) — Executor resolves the address to
+# a fresh bolt11 via FireBird.Lnurl.fetch_invoice/4 and then pays through
+# the standard bolt11 path.
+ln_addr_payment = Payment.new(
+  payment_hash: local_dedup_key,
+  destination_type: :ln_address,
+  destination: "user@example.com",
+  amount_sats: 1_000,
+  created_at: DateTime.utc_now()
+)
+
+# Lifecycle: pending → in_flight → succeeded | retrying → exhausted | unknown
+{:ok, in_flight} = Payment.mark_in_flight(bolt11_payment)
 {:ok, succeeded} = Payment.mark_succeeded(in_flight, preimage, fee_sats)
 
 # Retry with exponential backoff (max 3 attempts)
 {:ok, failed} = Payment.mark_failed(in_flight, "route not found")
-failed.status         # :retrying
-Payment.retriable?(failed)       # true
+failed.status                     # :retrying
+Payment.retriable?(failed)        # true
 Payment.next_retry_delay(failed)  # 1_000 (ms, doubles each attempt)
+
+# When a payment's outcome is indeterminate (HTTP timeout, task crash,
+# ambiguous 5xx), it lands in :unknown. Consumers MUST NOT release the
+# caller's reservation on this state — reconcile with the node first
+# via Client.get_outgoing_payment_by_hash/2.
 ```
 
 ### BOLT11 Amount Parsing
@@ -158,12 +192,35 @@ config = HTTP.new(
   finch_name: MyApp.Finch
 )
 
-# All operations take config as first argument
-{:ok, invoice} = HTTP.create_invoice(config, 1_000, "coffee")
-{:ok, result}  = HTTP.pay_invoice(config, bolt11, 1_000, "payment", 10)
+# All operations take config as first argument.
+{:ok, invoice} = HTTP.create_invoice(config, 1_000, "coffee", 3600)     # 4th arg = expiry seconds (nil for phoenixd default)
+{:ok, result}  = HTTP.pay_invoice(config, bolt11, 1_000, "payment", 10) # 5th arg = flat fee cap in sats (nil disables)
+{:ok, result}  = HTTP.pay_offer(config, "lno1...", 1_000, "payment", 10)
+{:ok, payment} = HTTP.get_outgoing_payment_by_hash(config, ln_payment_hash)
 {:ok, balance} = HTTP.get_balance(config)
 :ok            = HTTP.health_check(config)
 ```
+
+### Lightning Address (LUD-06 / LUD-16)
+
+```elixir
+alias FireBird.Lnurl
+
+# Resolve "user@example.com" → fresh bolt11 for a given amount.
+{:ok, %{bolt11: bolt11, payment_hash: hash, callback_url: url}} =
+  Lnurl.fetch_invoice("user@example.com", 1_000, MyApp.Finch)
+
+# Or check that an address's LNURL-pay endpoint is reachable without
+# consuming an invoice slot.
+:ok = Lnurl.probe("user@example.com", MyApp.Finch)
+```
+
+The resolver is SSRF-hardened: HTTPS only, DNS re-checked on every
+redirect (max 2), private/loopback/link-local addresses rejected before
+TCP connect, 64 KiB response body cap, 3 s connect / 5 s total timeout.
+`Executor` uses this internally for `destination_type: :ln_address`
+payments — you rarely call it directly unless you're staging bolt11s
+outside the standard executor path.
 
 ### PubSub
 
@@ -206,11 +263,22 @@ children = [
     pubsub_name: MyApp.FireBirdPubSub,
     low_watermark: 100_000,
     high_watermark: 1_000_000,
-    max_concurrent: 10
+    critical_watermark: 10_000,
+    max_concurrent: 10,
+    wal: {MyApp.PaymentWAL, wal_config}   # optional
   ]}
 ]
 
 Supervisor.start_link(children, strategy: :one_for_one)
+```
+
+Or let FireBird supervise its own Finch pool via the `:finch` option:
+
+```elixir
+{FireBird.Supervisor, [
+  client: {FireBird.HTTP, config},
+  finch: [name: MyApp.Finch]
+]}
 ```
 
 The `rest_for_one` supervisor starts children in order:
@@ -219,6 +287,7 @@ The `rest_for_one` supervisor starts children in order:
 2. **Monitor** (balance polling)
 3. **Manager** (invoice lifecycle)
 4. **Executor** (async payments)
+5. **Cleaner** (webhook dedup + rate-limit TTL sweeper)
 
 ### Webhook Handler
 
@@ -238,7 +307,7 @@ Features HMAC-SHA256 signature verification, replay protection, event deduplicat
 
 | Event | Fields | Description |
 |-------|--------|-------------|
-| `InvoicePaid` | `payment_hash`, `amount_sats`, `paid_at` | Invoice confirmed paid |
+| `InvoicePaid` | `payment_hash`, `amount_sats`, `received_sats`, `paid_at` | Invoice confirmed paid — consumers assert `received_sats >= amount_sats` |
 | `InvoiceExpired` | `payment_hash`, `amount_sats`, `expired_at` | Invoice expired |
 
 ### Payment Events
@@ -248,6 +317,7 @@ Features HMAC-SHA256 signature verification, replay protection, event deduplicat
 | `PaymentSent` | `payment_hash`, `amount_sats`, `fee_sats`, `preimage` | Payment succeeded |
 | `PaymentFailed` | `payment_hash`, `amount_sats`, `reason`, `attempt` | Attempt failed, may retry |
 | `PaymentExhausted` | `payment_hash`, `amount_sats`, `reason`, `attempts` | All retries exhausted |
+| `PaymentUnknown` | `payment_hash`, `amount_sats`, `reason`, `attempt`, `phoenixd_id` | Outcome indeterminate — reconcile before releasing reservations |
 
 ### Liquidity Events
 
@@ -270,11 +340,13 @@ defmodule MyApp.MockClient do
   @behaviour FireBird.Client
 
   @impl FireBird.Client
-  def create_invoice(config, amount_sats, description), do: ...
+  def create_invoice(config, amount_sats, description, expiry_seconds), do: ...
   def pay_invoice(config, bolt11, amount_sats, description, fee_limit_sats), do: ...
+  def pay_offer(config, offer, amount_sats, description, fee_limit_sats), do: ...
   def get_balance(config), do: ...
   def get_incoming_payment(config, payment_hash), do: ...
   def get_outgoing_payment(config, payment_id), do: ...
+  def get_outgoing_payment_by_hash(config, ln_payment_hash), do: ...
   def get_info(config), do: ...
   def health_check(config), do: ...
 
@@ -299,7 +371,7 @@ defmodule MyApp.PaymentWAL do
 end
 ```
 
-Pass to supervisor: `wal: MyApp.PaymentWAL`
+Pass to supervisor as a `{module, config}` tuple: `wal: {MyApp.PaymentWAL, wal_config}`. `Executor` calls `append/2` when a payment is added to the WAL and `recover/1` on boot to re-drive in-flight payments after a crash.
 
 ## Architecture
 
