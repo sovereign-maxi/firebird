@@ -1128,13 +1128,18 @@ defmodule FireBird.ExecutorTest do
   describe "push payments — :offer destination" do
     test "dispatches to pay_offer and stores in ETS as succeeded", ctx do
       payment = build_offer_payment()
+      # Preimage must hash to paymentHash — proof-of-payment
+      # validation is armed for push destinations, so a response
+      # with mismatched preimage/paymentHash gets rejected.
       preimage = :crypto.strong_rand_bytes(32)
       preimage_hex = Base.encode16(preimage, case: :lower)
+      ln_hash = :crypto.hash(:sha256, preimage)
+      ln_hash_hex = Base.encode16(ln_hash, case: :lower)
 
       MockClient.set_response(
         ctx.client,
         :pay_offer,
-        {:ok, %{"preimage" => preimage_hex, "fees" => 10}}
+        {:ok, %{"preimage" => preimage_hex, "paymentHash" => ln_hash_hex, "fees" => 10}}
       )
 
       assert :ok = Executor.submit(ctx.pid, payment)
@@ -1145,6 +1150,12 @@ defmodule FireBird.ExecutorTest do
           Executor.lookup(ctx.table, payment.payment_hash)
         )
       end)
+
+      # The bound ln_payment_hash comes from the response's
+      # paymentHash, NOT the local tracking key.
+      {:ok, record} = Executor.lookup(ctx.table, payment.payment_hash)
+      assert record.ln_payment_hash == ln_hash
+      assert record.preimage == preimage
 
       # Recorded call arrives with the offer string as the first arg,
       # not a bolt11 — this is the destination-dispatch invariant.
@@ -1173,11 +1184,14 @@ defmodule FireBird.ExecutorTest do
       payment = build_offer_payment()
       MockClient.set_response(ctx.client, :pay_invoice, {:error, :should_not_be_called})
 
+      preimage = :crypto.strong_rand_bytes(32)
+      preimage_hex = Base.encode16(preimage, case: :lower)
+      ln_hash_hex = Base.encode16(:crypto.hash(:sha256, preimage), case: :lower)
+
       MockClient.set_response(
         ctx.client,
         :pay_offer,
-        {:ok,
-         %{"preimage" => Base.encode16(:crypto.strong_rand_bytes(32), case: :lower), "fees" => 0}}
+        {:ok, %{"preimage" => preimage_hex, "paymentHash" => ln_hash_hex, "fees" => 0}}
       )
 
       assert :ok = Executor.submit(ctx.pid, payment)
@@ -1188,6 +1202,60 @@ defmodule FireBird.ExecutorTest do
 
       # pay_invoice must not have been called for this :offer submission
       assert MockClient.calls(ctx.client, :pay_invoice) == []
+    end
+
+    test "success response without paymentHash → :unknown (fail-closed)", ctx do
+      # Push destinations MUST have their ln_payment_hash bound
+      # before mark_succeeded runs; a phoenixd response missing
+      # paymentHash means we can't validate the preimage, so the
+      # outcome is :unknown rather than unvalidated-success.
+      payment = build_offer_payment()
+
+      Registry.register(ctx.pubsub, :payment, [])
+
+      preimage_hex = Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_offer,
+        {:ok, %{"preimage" => preimage_hex, "fees" => 10}}
+      )
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :unknown}}, Executor.lookup(ctx.table, payment.payment_hash))
+      end)
+    end
+  end
+
+  describe "push payments — :lnurl_fetch_failed classification" do
+    test "an :lnurl_fetch_failed task result is classified :definitive, not :unknown", ctx do
+      # Reaches the classify_error branch via the {:error, {:lnurl_fetch_failed, _}}
+      # tuple that the :ln_address task returns when the LNURL fetch
+      # step fails. Definitive means "no invoice ever existed, safe
+      # to release" — the caller can fall back to alternate handling
+      # without holding-for-reconcile.
+      payment = build_offer_payment()
+
+      Registry.register(ctx.pubsub, :payment, [])
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_offer,
+        {:error, {:lnurl_fetch_failed, :dns_no_records}}
+      )
+
+      Executor.submit(ctx.pid, payment)
+
+      # Definitive means PaymentExhausted (single-attempt terminal
+      # failure with the retry ladder consumed), not PaymentUnknown.
+      # A max_attempts=1 payment reaches :exhausted on definitive
+      # failure; higher attempts land :retrying then :exhausted.
+      assert_receive {FireBird.PubSub, :payment, evt}, 1_000
+      assert evt.__struct__ != FireBird.Events.PaymentUnknown
     end
   end
 

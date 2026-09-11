@@ -423,6 +423,13 @@ defmodule FireBird.Executor do
   # identical in trust model to plain bolt11 (payment hash known
   # before we pay, preimage validation armed, retry safety via LN
   # atomicity). Fetch failure = definitive non-attempt.
+  #
+  # Before calling `pay_invoice`, the task updates the ETS record
+  # with the fetched bolt11 + payment_hash so `mark_succeeded/4`'s
+  # preimage validation is armed on the outbound-side proof-of-
+  # payment check. Persisting bolt11 also improves crash recovery:
+  # boot replay sees the bound invoice + hash instead of the
+  # raw LN-address destination.
   defp spawn_payment_task(state, %Payment{destination_type: :ln_address} = payment) do
     Task.async(fn ->
       case FireBird.Lnurl.fetch_invoice(
@@ -430,7 +437,9 @@ defmodule FireBird.Executor do
              payment.amount_sats,
              lnurl_finch_name(state)
            ) do
-        {:ok, %{bolt11: bolt11}} ->
+        {:ok, %{bolt11: bolt11, payment_hash: ln_hash}} ->
+          bind_fetched_invoice!(state.table_name, payment.payment_hash, bolt11, ln_hash)
+
           state.client_mod.pay_invoice(
             state.client_config,
             bolt11,
@@ -443,6 +452,22 @@ defmodule FireBird.Executor do
           {:error, {:lnurl_fetch_failed, reason}}
       end
     end)
+  end
+
+  # Updates the ETS record for `tracking_id` with the fetched bolt11
+  # + LN payment hash. The write is atomic per ETS key and races
+  # only against the executor's own reader in `handle_result`,
+  # which runs AFTER the task returns — so this update is always
+  # visible by the time `mark_succeeded/4` validates the preimage.
+  defp bind_fetched_invoice!(table_name, tracking_id, bolt11, ln_hash) do
+    case :ets.lookup(table_name, tracking_id) do
+      [{^tracking_id, %Payment{} = existing}] ->
+        updated = %{existing | bolt11: bolt11, ln_payment_hash: ln_hash}
+        :ets.insert(table_name, {tracking_id, updated})
+
+      [] ->
+        :ok
+    end
   end
 
   # LNURL fetch runs through Finch — the same pool phoenixd HTTP uses,
@@ -494,20 +519,41 @@ defmodule FireBird.Executor do
     fee_raw = resp["routingFeeSat"] || resp["fees"]
     phoenixd_id = resp["paymentId"]
 
-    if is_binary(preimage_hex) and preimage_hex != "" do
-      process_preimage(state, payment, preimage_hex, fee_raw, phoenixd_id)
-    else
-      # A 2xx without a preimage is not proof of payment, and leaving
-      # the payment :in_flight would wedge it forever — no task remains,
-      # nothing re-polls, and the dedup gate blocks resubmission. The
-      # payment may have settled; force reconciliation instead.
-      Logger.warning(
-        "Executor: success response missing preimage for " <>
-          Base.encode16(payment.payment_hash, case: :lower) <>
-          " — keys: #{inspect(Map.keys(resp))} — marking :unknown"
-      )
+    # For push destinations without a pre-bound LN payment hash
+    # (`:offer` submits and any `:ln_address` where the fetch path
+    # somehow didn't bind), bind it from the response BEFORE
+    # `mark_succeeded/4` runs — otherwise preimage validation
+    # accepts an unvalidated preimage. If the response doesn't
+    # carry a parseable paymentHash for a push destination, treat
+    # the success as :unknown (fail-closed) rather than commit
+    # against unverifiable proof-of-payment.
+    case maybe_bind_ln_payment_hash(payment, resp) do
+      {:ok, payment} ->
+        if is_binary(preimage_hex) and preimage_hex != "" do
+          process_preimage(state, payment, preimage_hex, fee_raw, phoenixd_id)
+        else
+          # A 2xx without a preimage is not proof of payment, and
+          # leaving the payment :in_flight would wedge it forever —
+          # no task remains, nothing re-polls, and the dedup gate
+          # blocks resubmission. The payment may have settled;
+          # force reconciliation instead.
+          Logger.warning(
+            "Executor: success response missing preimage for " <>
+              Base.encode16(payment.payment_hash, case: :lower) <>
+              " — keys: #{inspect(Map.keys(resp))} — marking :unknown"
+          )
 
-      handle_unknown_outcome(state, payment, :missing_preimage_in_success_response)
+          handle_unknown_outcome(state, payment, :missing_preimage_in_success_response)
+        end
+
+      :unbindable ->
+        Logger.error(
+          "Executor: push success response missing paymentHash — " <>
+            "cannot arm preimage validation, marking :unknown, " <>
+            "tracking_id=#{Base.encode16(payment.payment_hash, case: :lower)}"
+        )
+
+        handle_unknown_outcome(state, payment, :push_response_missing_payment_hash)
     end
   end
 
@@ -546,6 +592,42 @@ defmodule FireBird.Executor do
 
     handle_unknown_outcome(state, payment, :unexpected_success_response)
   end
+
+  # Binds `ln_payment_hash` from a push-response's paymentHash field
+  # when needed. `:bolt11` payments always have `ln_payment_hash`
+  # pre-bound (the caller set it from the invoice). `:ln_address`
+  # payments get their hash bound by the LNURL-fetch stage
+  # (`bind_fetched_invoice!/4`) before `pay_invoice` runs. Only
+  # `:offer` payments actually reach this function with a nil hash
+  # in the normal happy path.
+  defp maybe_bind_ln_payment_hash(%Payment{ln_payment_hash: hash} = payment, _resp)
+       when is_binary(hash) and byte_size(hash) == 32 do
+    {:ok, payment}
+  end
+
+  defp maybe_bind_ln_payment_hash(%Payment{destination_type: :bolt11} = payment, _resp) do
+    # No hash bound but destination is bolt11 — legacy caller
+    # opted out of preimage validation. Preserve the existing
+    # unvalidated-with-warning behaviour.
+    {:ok, payment}
+  end
+
+  defp maybe_bind_ln_payment_hash(%Payment{destination_type: type} = payment, resp)
+       when type in [:offer, :ln_address] do
+    case decode_payment_hash(resp["paymentHash"]) do
+      {:ok, hash} -> {:ok, %{payment | ln_payment_hash: hash}}
+      :error -> :unbindable
+    end
+  end
+
+  defp decode_payment_hash(hex) when is_binary(hex) do
+    case Base.decode16(hex, case: :mixed) do
+      {:ok, hash} when byte_size(hash) == 32 -> {:ok, hash}
+      _other -> :error
+    end
+  end
+
+  defp decode_payment_hash(_other), do: :error
 
   # A 4xx from /payinvoice usually means the payment was never
   # attempted (bad invoice, unsupported network). But it can also
@@ -611,6 +693,11 @@ defmodule FireBird.Executor do
   # the node provably never saw the payment, so release is safe.
   defp classify_error(:circuit_open), do: :definitive
   defp classify_error(:breaker_unavailable), do: :definitive
+
+  # LNURL-pay fetch failed before any bolt11 was ever generated. No
+  # invoice exists on Lightning, nothing was paid — definitive
+  # non-attempt. Safe to release / fall back without reconciliation.
+  defp classify_error({:lnurl_fetch_failed, _reason}), do: :definitive
 
   defp classify_error({:phoenixd_error, kind, _msg})
        when kind in [:route_not_found, :insufficient_liquidity, :temporary_channel_failure] do
