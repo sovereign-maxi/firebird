@@ -175,8 +175,12 @@ defmodule FireBird.ManagerTest do
     end
   end
 
-  describe "poll — preimage is proof of payment (isPaid flag is ignored)" do
-    test "preimage present with isPaid=false confirms payment", ctx do
+  describe "poll — isPaid is phoenixd's canonical settlement signal" do
+    test "preimage present with isPaid=false does NOT confirm (race guard)", ctx do
+      # phoenixd exposes preimage during the HTLC settlement window before
+      # updating receivedSat + flipping isPaid. Confirming on preimage alone
+      # races with any downstream expiry — must wait for the isPaid: true
+      # finalisation.
       preimage = :crypto.strong_rand_bytes(32)
       payment_hash = :crypto.hash(:sha256, preimage)
       preimage_hex = Base.encode16(preimage, case: :lower)
@@ -194,14 +198,17 @@ defmodule FireBird.ManagerTest do
       send(ctx.pid, :poll)
       :sys.get_state(ctx.pid)
 
-      assert_receive {FireBird.PubSub, :invoice,
-                      %FireBird.Events.InvoicePaid{payment_hash: ^payment_hash}}
+      refute_receive {FireBird.PubSub, :invoice, %FireBird.Events.InvoicePaid{}}, 200
 
-      assert {:ok, paid} = Manager.lookup(ctx.table, payment_hash)
-      assert paid.status == :paid
+      assert {:ok, tracked} = Manager.lookup(ctx.table, payment_hash)
+      assert tracked.status == :pending
     end
 
-    test "preimage present without isPaid key confirms payment", ctx do
+    test "preimage present without isPaid key does NOT confirm (race guard)", ctx do
+      # phoenixd briefly exposes preimage before finalising isPaid +
+      # receivedSat during auto-liquidity / MPP settlement — empirically
+      # observed as a multi-second window. Gating on preimage alone races
+      # with any downstream expiry; wait for isPaid: true.
       preimage = :crypto.strong_rand_bytes(32)
       payment_hash = :crypto.hash(:sha256, preimage)
       preimage_hex = Base.encode16(preimage, case: :lower)
@@ -219,11 +226,10 @@ defmodule FireBird.ManagerTest do
       send(ctx.pid, :poll)
       :sys.get_state(ctx.pid)
 
-      assert_receive {FireBird.PubSub, :invoice,
-                      %FireBird.Events.InvoicePaid{payment_hash: ^payment_hash}}
+      refute_receive {FireBird.PubSub, :invoice, %FireBird.Events.InvoicePaid{}}, 200
 
-      assert {:ok, paid} = Manager.lookup(ctx.table, payment_hash)
-      assert paid.status == :paid
+      assert {:ok, tracked} = Manager.lookup(ctx.table, payment_hash)
+      assert tracked.status == :pending
     end
 
     test "isPaid=true with valid preimage confirms payment", ctx do

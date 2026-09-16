@@ -182,13 +182,20 @@ defmodule FireBird.Manager do
     end
   end
 
+  # `isPaid` is phoenixd's canonical "the payment settled AND the
+  # ledger is reconciled" signal. A preimage can appear in the
+  # response before phoenixd has finished updating receivedSat + the
+  # isPaid flag — observed empirically as a multi-second window with
+  # `preimage: <set>, receivedSat: 0, isPaid: false` finalising to
+  # `receivedSat: N, isPaid: true`. Gating on preimage alone races
+  # with any downstream invoice / quote expiry. Wait for isPaid.
   defp poll_payment_status(state, invoice) do
     case state.client_mod.get_incoming_payment(state.client_config, invoice.payment_hash) do
-      {:ok, %{"preimage" => preimage_hex} = resp}
+      {:ok, %{"isPaid" => true, "preimage" => preimage_hex} = resp}
       when is_binary(preimage_hex) and preimage_hex != "" ->
         validate_received_and_confirm(state, invoice, preimage_hex, resp)
 
-      {:ok, _pending} ->
+      {:ok, _pending_or_unpaid} ->
         :ok
 
       {:error, reason} ->
