@@ -17,7 +17,14 @@ defmodule FireBird.Invoice do
     :preimage,
     :paid_at,
     :description,
-    :external_id
+    :external_id,
+    # Sats actually received on the LN channel when the invoice was
+    # settled. May exceed `amount_sats` on overpayment; consumers
+    # driving refund/surplus accounting off the tracked record (e.g.
+    # a boot-time sweep after the live `%InvoicePaid{}` was missed)
+    # need the true received value, not the invoice's asked amount.
+    # `nil` on pending / expired invoices.
+    :received_sats
   ]
 
   @type status :: :pending | :paid | :expired
@@ -32,7 +39,8 @@ defmodule FireBird.Invoice do
           preimage: binary() | nil,
           paid_at: DateTime.t() | nil,
           description: String.t() | nil,
-          external_id: String.t() | nil
+          external_id: String.t() | nil,
+          received_sats: pos_integer() | nil
         }
 
   @doc """
@@ -67,18 +75,29 @@ defmodule FireBird.Invoice do
   Returns `{:error, :invalid_preimage}` if validation fails,
   or `{:error, :not_pending}` if the invoice is not in pending status.
   """
-  @spec mark_paid(t(), binary()) :: {:ok, t()} | {:error, :invalid_preimage | :not_pending}
-  def mark_paid(%__MODULE__{status: :pending} = invoice, preimage) when is_binary(preimage) do
+  @spec mark_paid(t(), binary(), pos_integer() | nil) ::
+          {:ok, t()} | {:error, :invalid_preimage | :not_pending}
+  def mark_paid(invoice, preimage, received_sats \\ nil)
+
+  def mark_paid(%__MODULE__{status: :pending} = invoice, preimage, received_sats)
+      when is_binary(preimage) do
     computed = :crypto.hash(:sha256, preimage)
 
     if Plug.Crypto.secure_compare(computed, invoice.payment_hash) do
-      {:ok, %{invoice | status: :paid, preimage: preimage, paid_at: DateTime.utc_now()}}
+      {:ok,
+       %{
+         invoice
+         | status: :paid,
+           preimage: preimage,
+           paid_at: DateTime.utc_now(),
+           received_sats: received_sats
+       }}
     else
       {:error, :invalid_preimage}
     end
   end
 
-  def mark_paid(%__MODULE__{}, _preimage), do: {:error, :not_pending}
+  def mark_paid(%__MODULE__{}, _preimage, _received_sats), do: {:error, :not_pending}
 
   @doc """
   Marks a pending invoice as expired.

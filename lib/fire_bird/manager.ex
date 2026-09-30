@@ -244,10 +244,11 @@ defmodule FireBird.Manager do
 
   defp parse_received_sats(_resp), do: :unknown
 
-  defp confirm_payment(state, invoice, preimage_hex, received_sats) do
+  defp confirm_payment(state, invoice, preimage_hex, received_sats)
+       when is_integer(received_sats) do
     with {:ok, preimage} <- Base.decode16(preimage_hex, case: :mixed),
          :ok <- validate_preimage_length(preimage),
-         {:ok, paid_invoice} <- Invoice.mark_paid(invoice, preimage) do
+         {:ok, paid_invoice} <- Invoice.mark_paid(invoice, preimage, received_sats) do
       :ets.insert(state.table_name, {invoice.payment_hash, paid_invoice})
 
       # Publish both `received_sats` (what actually landed on LN) and
