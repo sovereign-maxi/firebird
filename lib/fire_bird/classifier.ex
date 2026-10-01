@@ -1,4 +1,4 @@
-defmodule FireBird.PaymentFailureClassifier do
+defmodule FireBird.Classifier do
   @moduledoc """
   Classifies phoenixd's `payment_failed` reason strings into the
   executor's retry buckets.

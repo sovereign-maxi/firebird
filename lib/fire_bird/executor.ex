@@ -20,9 +20,9 @@ defmodule FireBird.Executor do
 
   use GenServer
 
+  alias FireBird.Classifier
   alias FireBird.Events.{PaymentExhausted, PaymentFailed, PaymentSent, PaymentUnknown}
   alias FireBird.Payment
-  alias FireBird.PaymentFailureClassifier
   alias FireBird.PubSub
   alias FireBird.Util
 
@@ -573,7 +573,7 @@ defmodule FireBird.Executor do
   # the classifier so route-not-found / liquidity transients can
   # retry and definitive failures release the reservation.
   defp process_result(state, payment, {:ok, %{"type" => "payment_failed", "reason" => reason}}) do
-    kind = PaymentFailureClassifier.classify(reason)
+    kind = Classifier.classify(reason)
     classified = {:phoenixd_error, kind, reason}
 
     case kind do
