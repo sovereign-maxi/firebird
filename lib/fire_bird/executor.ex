@@ -90,6 +90,29 @@ defmodule FireBird.Executor do
     end
   end
 
+  @doc """
+  Node-side reconciliation query for a payment hash — asks phoenixd
+  directly via `get_outgoing_payment_by_hash/2`. Returns one of:
+
+    * `:settled` — the node reports `isPaid: true` for this hash.
+    * `:failed`  — the node has a terminal non-settled record
+      (`completedAt` present but not paid) OR no record at all
+      (404 — the attempt never reached the node). Safe to release.
+    * `:pending` — node has a non-terminal record (still in flight).
+    * `:unknown` — lookup transport failed; caller MUST NOT release.
+
+  Callers (`Arcade.Payments.Withdrawals.reconcile_unknown/2`)
+  use this to escape the local-ETS-only reconcile trap: firebird's
+  own `:unknown` state is deliberately never swept, so the venue
+  needs an authoritative node check before escalating to halt.
+  """
+  @spec confirm_against_node(GenServer.server(), binary(), timeout()) ::
+          :settled | :failed | :pending | :unknown
+  def confirm_against_node(server, payment_hash, timeout \\ 5_000)
+      when is_binary(payment_hash) do
+    GenServer.call(server, {:confirm_against_node, payment_hash}, timeout)
+  end
+
   @impl GenServer
   def init(opts) do
     Process.flag(:trap_exit, true)
@@ -153,6 +176,31 @@ defmodule FireBird.Executor do
           {:error, reason, state} -> {:reply, {:error, reason}, state}
         end
     end
+  end
+
+  def handle_call({:confirm_against_node, hash}, _from, state) do
+    outcome =
+      case state.client_mod.get_outgoing_payment_by_hash(state.client_config, hash) do
+        {:ok, %{"isPaid" => true}} ->
+          :settled
+
+        {:ok, %{"completedAt" => completed_at}}
+        when is_binary(completed_at) or is_integer(completed_at) ->
+          # Terminal non-settled record on the node — provably not paid.
+          :failed
+
+        {:ok, _still_pending} ->
+          :pending
+
+        {:error, {:http_error, 404, _body}} ->
+          # No outgoing record — the attempt never reached the node.
+          :failed
+
+        {:error, _lookup_failure} ->
+          :unknown
+      end
+
+    {:reply, outcome, state}
   end
 
   # Refuses a repeat `submit` for a payment_hash the executor is

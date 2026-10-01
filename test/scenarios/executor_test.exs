@@ -279,6 +279,68 @@ defmodule FireBird.ExecutorTest do
     end
   end
 
+  describe "confirm_against_node/2 — reconcile against the authoritative Lightning outcome" do
+    # External reconcile hook: callers holding a reservation on a
+    # payment with a stuck `:unknown` status (firebird deliberately
+    # never sweeps `:unknown`) can ask the node directly rather than
+    # waiting for the local reconciler to time out.
+
+    test ":settled when the node reports isPaid: true", ctx do
+      hash = :crypto.strong_rand_bytes(32)
+      MockClient.set_response(ctx.client, :get_outgoing_payment_by_hash, {:ok, %{"isPaid" => true}})
+
+      assert :settled = Executor.confirm_against_node(ctx.pid, hash)
+    end
+
+    test ":failed when the node has a completedAt but no settlement", ctx do
+      hash = :crypto.strong_rand_bytes(32)
+
+      MockClient.set_response(
+        ctx.client,
+        :get_outgoing_payment_by_hash,
+        {:ok, %{"isPaid" => false, "completedAt" => "2026-10-01T00:00:00Z"}}
+      )
+
+      assert :failed = Executor.confirm_against_node(ctx.pid, hash)
+    end
+
+    test ":failed when the node has no outgoing record (404)", ctx do
+      hash = :crypto.strong_rand_bytes(32)
+
+      MockClient.set_response(
+        ctx.client,
+        :get_outgoing_payment_by_hash,
+        {:error, {:http_error, 404, "not found"}}
+      )
+
+      assert :failed = Executor.confirm_against_node(ctx.pid, hash)
+    end
+
+    test ":pending when the node shows an in-flight record", ctx do
+      hash = :crypto.strong_rand_bytes(32)
+
+      MockClient.set_response(
+        ctx.client,
+        :get_outgoing_payment_by_hash,
+        {:ok, %{"isPaid" => false}}
+      )
+
+      assert :pending = Executor.confirm_against_node(ctx.pid, hash)
+    end
+
+    test ":unknown when the lookup transport fails — caller MUST NOT release", ctx do
+      hash = :crypto.strong_rand_bytes(32)
+
+      MockClient.set_response(
+        ctx.client,
+        :get_outgoing_payment_by_hash,
+        {:error, :timeout}
+      )
+
+      assert :unknown = Executor.confirm_against_node(ctx.pid, hash)
+    end
+  end
+
   describe "submit-side idempotency" do
     test "rejects duplicate submit while an earlier one is in-flight", ctx do
       Registry.register(ctx.pubsub, :payment, [])
