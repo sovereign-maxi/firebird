@@ -22,6 +22,7 @@ defmodule FireBird.Executor do
 
   alias FireBird.Events.{PaymentExhausted, PaymentFailed, PaymentSent, PaymentUnknown}
   alias FireBird.Payment
+  alias FireBird.PaymentFailureClassifier
   alias FireBird.PubSub
   alias FireBird.Util
 
@@ -559,6 +560,31 @@ defmodule FireBird.Executor do
 
       [] ->
         state
+    end
+  end
+
+  # phoenixd returns HTTP 200 for BOTH successful and failed payment
+  # attempts — the actual outcome rides as a `type` discriminator in
+  # the JSON body. A failed payment surfaces as
+  # `{"type": "payment_failed", "paymentHash": "...", "reason": "..."}`.
+  # Treating 200 as "sent" misclassifies every real payment failure
+  # as `:unknown` (missing preimage), which pins the reservation and
+  # eventually auto-halts the venue. Route payment_failed through
+  # the classifier so route-not-found / liquidity transients can
+  # retry and definitive failures release the reservation.
+  defp process_result(state, payment, {:ok, %{"type" => "payment_failed", "reason" => reason}}) do
+    kind = PaymentFailureClassifier.classify(reason)
+    classified = {:phoenixd_error, kind, reason}
+
+    case kind do
+      k when k in [:route_not_found, :insufficient_liquidity, :temporary_channel_failure] ->
+        handle_retryable_error(state, payment, classified)
+
+      :definitive ->
+        handle_definitive_failure(state, payment, classified)
+
+      :connection_ambiguous ->
+        handle_unknown_outcome(state, payment, classified)
     end
   end
 

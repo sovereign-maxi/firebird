@@ -199,6 +199,115 @@ defmodule FireBird.ExecutorTest do
     end
   end
 
+  describe "phoenixd 200 OK with payment_failed body" do
+    # phoenixd returns HTTP 200 for BOTH successful AND failed payment
+    # attempts — the actual outcome rides as `type` in the JSON body.
+    # Pre-fix, failed payments arrived as `{:ok, map}` with no preimage
+    # and classified as `:unknown`, pinning the reservation forever and
+    # eventually auto-halting the venue. The classifier maps common
+    # lightning-kmp `PaymentFailure.explain()` strings to the right
+    # retry bucket.
+
+    test "RouteNotFound-flavoured reason retries then succeeds", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      preimage = :crypto.strong_rand_bytes(32)
+      preimage_hex = Base.encode16(preimage, case: :lower)
+
+      call_count = :counters.new(1, [:atomics])
+
+      MockClient.set_response(ctx.client, :pay_invoice, fn ->
+        count = :counters.get(call_count, 1)
+        :counters.add(call_count, 1, 1)
+
+        if count == 0 do
+          {:ok,
+           %{
+             "type" => "payment_failed",
+             "paymentHash" => "deadbeef",
+             "reason" => "RouteNotFound"
+           }}
+        else
+          {:ok, %{"preimage" => preimage_hex, "fees" => 2}}
+        end
+      end)
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 1_000
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentSent{}}, 5_000
+    end
+
+    test "TemporaryChannelFailure reason classifies as retryable (PaymentFailed, not Exhausted)",
+         ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_invoice,
+        {:ok,
+         %{"type" => "payment_failed", "reason" => "TemporaryChannelFailure(short_channel_id=..)"}}
+      )
+
+      Executor.submit(ctx.pid, payment)
+
+      # Retryable: the first attempt emits PaymentFailed (not
+      # PaymentExhausted) because attempts remain in the retry ladder.
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 1_000
+    end
+
+    test "InsufficientBalance reason classifies as definitive — one Exhausted, no retries", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_invoice,
+        {:ok, %{"type" => "payment_failed", "reason" => "InsufficientBalance"}}
+      )
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 200
+    end
+
+    test "ChannelClosing reason classifies as :unknown — reservation must not release", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_invoice,
+        {:ok, %{"type" => "payment_failed", "reason" => "ChannelClosing"}}
+      )
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 200
+    end
+
+    test "unknown reason strings fall through to :definitive (fail-closed)", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(max_attempts: 3)
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_invoice,
+        {:ok, %{"type" => "payment_failed", "reason" => "SomeNewKmpFailureEnum"}}
+      )
+
+      Executor.submit(ctx.pid, payment)
+
+      # Unknown reasons release the reservation rather than pinning
+      # it in an unknown loop.
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 1_000
+    end
+  end
+
   describe "unknown-outcome errors (fail-closed)" do
     test "HTTP timeout publishes PaymentUnknown, NOT PaymentFailed/Exhausted", ctx do
       Registry.register(ctx.pubsub, :payment, [])

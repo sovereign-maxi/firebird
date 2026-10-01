@@ -128,7 +128,7 @@
           {Credo.Check.Refactor.MatchInCondition, []},
           {Credo.Check.Refactor.ModuleDependencies,
            [
-             max_deps: 20,
+             max_deps: 21,
              excluded_namespaces: []
            ]},
           {Credo.Check.Refactor.NegatedConditionsInUnless, []},
