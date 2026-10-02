@@ -27,6 +27,7 @@ defmodule FireBird.Bolt11 do
   # payment_hash (256-bit binary, always exactly 52 bech32 chars =
   # 260 bits with 4 trailing padding bits).
   @tag_payment_hash 1
+  @tag_description_hash 23
   @payment_hash_length_bech32 52
 
   @doc """
@@ -140,6 +141,29 @@ defmodule FireBird.Bolt11 do
 
   def payment_hash(_invalid), do: {:error, :invalid_input}
 
+  @doc """
+  Extracts the 32-byte description-hash (tag 23, `h`) from a bolt11.
+
+  The description hash is the sha256 of the invoice's purpose
+  description — LUD-06 LNURL-pay flows bind it to the metadata the
+  receiver first served, so callers can verify the invoice came
+  from the same endpoint that produced the metadata.
+
+  Returns `{:error, :description_hash_missing}` when the invoice
+  carries a plain `d` (description) tag instead of `h`, which is
+  the normal shape for most bolt11s outside LNURL-pay.
+  """
+  @spec description_hash(String.t()) :: {:ok, binary()} | {:error, atom()}
+  def description_hash(bolt11) when is_binary(bolt11) do
+    with {:ok, rest} <- strip_prefix(String.downcase(bolt11)),
+         {:ok, payload_chars} <- data_chars(rest),
+         {:ok, five_bit_stream} <- decode_bech32(payload_chars) do
+      find_description_hash(five_bit_stream)
+    end
+  end
+
+  def description_hash(_invalid), do: {:error, :invalid_input}
+
   # Strip the amount + multiplier + `1` separator, leaving just the
   # bech32 data payload (including the 6-char checksum tail).
   #
@@ -212,6 +236,32 @@ defmodule FireBird.Bolt11 do
   end
 
   defp walk_tagged_fields(_other), do: {:error, :payment_hash_missing}
+
+  defp find_description_hash(stream) when length(stream) < 7,
+    do: {:error, :payload_too_short}
+
+  defp find_description_hash(stream) do
+    walk_description_hash_fields(Enum.drop(stream, 7))
+  end
+
+  defp walk_description_hash_fields([]), do: {:error, :description_hash_missing}
+
+  defp walk_description_hash_fields([tag, len_hi, len_lo | rest]) do
+    length_bech32 = len_hi * 32 + len_lo
+
+    cond do
+      length(rest) < length_bech32 ->
+        {:error, :payload_truncated}
+
+      tag == @tag_description_hash and length_bech32 == @payment_hash_length_bech32 ->
+        {:ok, five_bit_to_binary(Enum.take(rest, length_bech32), 256)}
+
+      true ->
+        walk_description_hash_fields(Enum.drop(rest, length_bech32))
+    end
+  end
+
+  defp walk_description_hash_fields(_other), do: {:error, :description_hash_missing}
 
   # Packs the 5-bit values MSB-first into a binary of exactly
   # `output_bits` bits, discarding any trailing padding bits the
