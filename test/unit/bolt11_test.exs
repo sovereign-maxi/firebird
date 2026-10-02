@@ -124,6 +124,24 @@ defmodule FireBird.Bolt11Test do
       assert {:error, _reason} = Bolt11.payment_hash("lnbc1m1pdummy" <> String.duplicate("q", 40))
     end
 
+    test "extracts description_hash when the invoice carries an `h` tag (synthesized)" do
+      # Hand-rolled bolt11 with the tag-23 payload set to a known
+      # 32-byte value. Firebird doesn't verify bech32 checksum, so
+      # the parser round-trips a synthetic invoice unchanged.
+      dh = :crypto.hash(:sha256, "lnurl-pay metadata test")
+      invoice = build_synthetic_invoice(amount_sats: 100_000, description_hash: dh)
+
+      assert {:ok, ^dh} = Bolt11.description_hash(invoice)
+    end
+
+    test "description_hash/1 refuses invoices with no `h` tag (spec vector has `d`)" do
+      # The walker either runs off the end at a tagged-field
+      # boundary (`:description_hash_missing`) or finds a truncated
+      # trailing field (`:payload_truncated`). Both correctly refuse.
+      assert {:error, reason} = Bolt11.description_hash(@spec_invoice)
+      assert reason in [:description_hash_missing, :payload_truncated]
+    end
+
     test "handles amounts containing the digit 1 (last-1 separator rule)" do
       # bech32's separator is the LAST `1` — splitting on the first `1`
       # cuts through amount digits like `10u`, `1u`, or `2510u`. Same
@@ -138,4 +156,48 @@ defmodule FireBird.Bolt11Test do
       end
     end
   end
+
+  # --- Synthetic invoice builder (test support) ---
+  #
+  # Emits amount + payment_hash tag + description_hash tag + filler
+  # signature. Firebird's parser doesn't verify bech32 checksum, so
+  # a hand-rolled stream round-trips cleanly through parse_amount/1
+  # + payment_hash/1 + description_hash/1. Not a general-purpose
+  # encoder.
+
+  @bech32_alphabet ~c"qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+  @tag_hash_length_bech32 52
+
+  defp build_synthetic_invoice(opts) do
+    amount_sats = Keyword.fetch!(opts, :amount_sats)
+    payment_hash = Keyword.get(opts, :payment_hash, :crypto.strong_rand_bytes(32))
+    description_hash = Keyword.get(opts, :description_hash, :crypto.strong_rand_bytes(32))
+
+    amount_prefix = Integer.to_string(amount_sats * 10_000) <> "p"
+    timestamp = String.duplicate("q", 7)
+
+    p_header = tag_header(1)
+    p_body = binary_to_bech32(payment_hash, @tag_hash_length_bech32)
+
+    h_header = tag_header(23)
+    h_body = binary_to_bech32(description_hash, @tag_hash_length_bech32)
+
+    sig = String.duplicate("q", 104)
+
+    "lnbc" <> amount_prefix <> "1" <> timestamp <> p_header <> p_body <> h_header <> h_body <> sig
+  end
+
+  defp tag_header(tag_value) do
+    len_hi = div(@tag_hash_length_bech32, 32)
+    len_lo = rem(@tag_hash_length_bech32, 32)
+    <<char(tag_value), char(len_hi), char(len_lo)>>
+  end
+
+  defp binary_to_bech32(binary, output_chars) do
+    pad_bits = output_chars * 5 - bit_size(binary)
+    padded = <<binary::bitstring, 0::size(pad_bits)>>
+    for <<v::size(5) <- padded>>, into: "", do: <<char(v)>>
+  end
+
+  defp char(index) when index in 0..31, do: Enum.at(@bech32_alphabet, index)
 end
