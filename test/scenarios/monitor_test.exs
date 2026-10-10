@@ -162,6 +162,73 @@ defmodule FireBird.MonitorTest do
 
       assert Process.alive?(ctx.pid)
     end
+
+    test "sensor-not-ready poll skips ETS, telemetry, and thresholds", ctx do
+      Registry.register(ctx.pubsub, :liquidity, [])
+
+      # First poll: healthy. Seeds the cache so a subsequent skip
+      # has something to NOT overwrite.
+      MockClient.set_response(ctx.client, :get_info, {:ok, %{"balanceSat" => 500_000}})
+      send(ctx.pid, :poll)
+      :sys.get_state(ctx.pid)
+      assert {:ok, 500_000} = Monitor.get_balance(ctx.table)
+
+      # Attach a telemetry probe BEFORE the sync-window poll.
+      test_pid = self()
+      handler_id = {__MODULE__, :skip_poll_probe}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:fire_bird, :liquidity, :poll],
+          fn _event, measurements, metadata, _config ->
+            send(test_pid, {:poll_telemetry, measurements, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      # Phoenixd mid-sync: channel exists but is "Syncing", no
+      # top-level balance. Pre-fix, Monitor would reduce to 0,
+      # overwrite the cache, fire telemetry, and publish Critical.
+      MockClient.set_response(
+        ctx.client,
+        :get_info,
+        {:ok, %{"channels" => [%{"state" => "Syncing", "balanceSat" => 400_000}]}}
+      )
+
+      send(ctx.pid, :poll)
+      :sys.get_state(ctx.pid)
+
+      # Previous honest balance retained.
+      assert {:ok, 500_000} = Monitor.get_balance(ctx.table)
+      # No telemetry on the skip.
+      refute_receive {:poll_telemetry, _, _}, 50
+      # No liquidity event fired.
+      refute_receive {FireBird.PubSub, :liquidity, _}, 50
+    end
+
+    test "recovery after a skip resumes normal threshold evaluation", ctx do
+      Registry.register(ctx.pubsub, :liquidity, [])
+
+      # Skip-poll window first.
+      MockClient.set_response(
+        ctx.client,
+        :get_info,
+        {:ok, %{"channels" => [%{"state" => "Syncing"}]}}
+      )
+
+      send(ctx.pid, :poll)
+      :sys.get_state(ctx.pid)
+
+      # Then a healthy reading — thresholds evaluate normally.
+      MockClient.set_response(ctx.client, :get_info, {:ok, %{"balanceSat" => 750_000}})
+      send(ctx.pid, :poll)
+      :sys.get_state(ctx.pid)
+
+      assert {:ok, 750_000} = Monitor.get_balance(ctx.table)
+    end
   end
 
   describe "ensure_integer robustness" do

@@ -18,6 +18,7 @@ defmodule FireBird.Monitor do
   use GenServer
 
   alias FireBird.Events.{LiquidityCritical, LiquidityLow, LiquidityRecovered}
+  alias FireBird.Info
   alias FireBird.PubSub
   alias FireBird.Util
 
@@ -109,9 +110,7 @@ defmodule FireBird.Monitor do
   defp poll_balance(state) do
     case state.client_mod.get_info(state.client_config) do
       {:ok, info} ->
-        balance = info["balanceSat"] || info["balance"] || sum_channel_balance(info)
-
-        case Util.parse_integer(balance) do
+        case Info.channel_balance_sats(info) do
           {:ok, balance_sats} ->
             :ets.insert(state.table_name, {:balance, balance_sats})
             store_inbound_liquidity(state.table_name, info)
@@ -124,9 +123,14 @@ defmodule FireBird.Monitor do
 
             check_thresholds(state, balance_sats)
 
-          :error ->
-            Logger.warning("Monitor: unparseable balance: #{inspect(balance)}, skipping poll")
-
+          :unavailable ->
+            # Sensor not ready — don't touch cache, telemetry, or
+            # thresholds. The previous honest balance stays in ETS;
+            # downstream drain-tracker + cache freshness ride on
+            # the last successful poll until a healthy reading
+            # arrives. Signing a zero through here would false-
+            # trigger `%LiquidityCritical{}` every phoenixd sync.
+            Logger.debug("Monitor: sensor not ready, skipping poll")
             state
         end
 
@@ -151,19 +155,6 @@ defmodule FireBird.Monitor do
   end
 
   defp store_inbound_liquidity(_table, _info), do: :ok
-
-  defp sum_channel_balance(%{"channels" => channels}) when is_list(channels) do
-    channels
-    |> Enum.filter(&(&1["state"] == "Normal"))
-    |> Enum.reduce(0, fn ch, acc ->
-      case Util.parse_integer(ch["balanceSat"]) do
-        {:ok, sats} -> acc + sats
-        :error -> acc
-      end
-    end)
-  end
-
-  defp sum_channel_balance(_other), do: nil
 
   defp check_thresholds(state, balance_sats) do
     cond do
