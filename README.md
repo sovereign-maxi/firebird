@@ -64,10 +64,12 @@ end
 | `FireBird.Client` | Behaviour contract for Phoenixd API operations |
 | `FireBird.WAL` | Optional write-ahead log behaviour (append + recover) |
 | `FireBird.Bolt11` | Pure BOLT11 invoice amount + payment-hash parser |
+| `FireBird.Classifier` | Maps phoenixd `payment_failed` reasons to retry buckets (retryable / definitive / connection-ambiguous) |
 | `FireBird.Fees` | Fee calculation with PPM, floor, and ceiling clamping |
 | `FireBird.Lnurl` | LUD-06 / LUD-16 (Lightning Address) resolver with SSRF hardening |
 | `FireBird.PubSub` | Registry-based event publish/subscribe |
 | `FireBird.HTTP` | Finch-based Phoenixd REST client implementing Client |
+| `FireBird.Info` | Pure interpretation of phoenixd `getInfo` payloads — channel-balance readiness decided in one place |
 | `FireBird.Monitor` | Periodic balance polling with threshold alerts |
 | `FireBird.Manager` | Invoice lifecycle tracking via ETS |
 | `FireBird.Executor` | Async payment execution with Task-based concurrency |
