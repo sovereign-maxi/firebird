@@ -45,8 +45,6 @@ defmodule FireBird.Lnurl do
 
   alias FireBird.Bolt11
 
-  require Logger
-
   @type ln_address :: String.t()
 
   @type resolved :: %{
