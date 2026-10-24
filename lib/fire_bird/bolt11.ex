@@ -271,7 +271,7 @@ defmodule FireBird.Bolt11 do
     bitstream =
       Enum.reduce(chars, <<>>, fn value, acc -> <<acc::bitstring, value::size(5)>> end)
 
-    <<hash::bitstring-size(output_bits), _padding::bitstring>> = bitstream
+    <<hash::bitstring-size(^output_bits), _padding::bitstring>> = bitstream
     <<hash::bitstring>>
   end
 end
