@@ -306,7 +306,7 @@ defmodule FireBird.ManagerTest do
   end
 
   describe "poll — receivedSat validation" do
-    test "underpaid invoice is NOT confirmed", ctx do
+    test "underpaid invoice confirms actual received sats", ctx do
       preimage = :crypto.strong_rand_bytes(32)
       payment_hash = :crypto.hash(:sha256, preimage)
       preimage_hex = Base.encode16(preimage, case: :lower)
@@ -324,9 +324,15 @@ defmodule FireBird.ManagerTest do
       send(ctx.pid, :poll)
       :sys.get_state(ctx.pid)
 
-      refute_receive {FireBird.PubSub, :invoice, %FireBird.Events.InvoicePaid{}}
-      assert {:ok, unchanged} = Manager.lookup(ctx.table, payment_hash)
-      assert unchanged.status == :pending
+      assert_receive {FireBird.PubSub, :invoice,
+                      %FireBird.Events.InvoicePaid{
+                        payment_hash: ^payment_hash,
+                        received_sats: 5_000
+                      }}
+
+      assert {:ok, paid} = Manager.lookup(ctx.table, payment_hash)
+      assert paid.status == :paid
+      assert paid.received_sats == 5_000
     end
 
     test "exact amount is confirmed", ctx do
@@ -392,7 +398,7 @@ defmodule FireBird.ManagerTest do
       MockClient.set_response(
         ctx.client,
         :get_incoming_payment,
-        {:ok, %{"isPaid" => true, "preimage" => preimage_hex, "receivedSat" => 1_000}}
+        {:ok, %{"isPaid" => true, "preimage" => preimage_hex}}
       )
 
       send(ctx.pid, :poll)

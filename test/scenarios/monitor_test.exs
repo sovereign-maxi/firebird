@@ -53,6 +53,33 @@ defmodule FireBird.MonitorTest do
     end
   end
 
+  describe "get_inbound_liquidity/1" do
+    test "returns :not_found initially", %{table: table} do
+      assert {:error, :not_found} = Monitor.get_inbound_liquidity(table)
+    end
+
+    test "sums inbound liquidity across normal channels", ctx do
+      MockClient.set_response(
+        ctx.client,
+        :get_info,
+        {:ok,
+         %{
+           "balanceSat" => 500_000,
+           "channels" => [
+             %{"state" => "Normal", "inboundLiquiditySat" => 400_000},
+             %{"state" => "Normal", "inboundLiquiditySat" => "100000"},
+             %{"state" => "Syncing", "inboundLiquiditySat" => 50_000}
+           ]
+         }}
+      )
+
+      send(ctx.pid, :poll)
+      :sys.get_state(ctx.pid)
+
+      assert {:ok, 500_000} = Monitor.get_inbound_liquidity(ctx.table)
+    end
+  end
+
   describe "poll" do
     test "stores balance in ETS", ctx do
       MockClient.set_response(ctx.client, :get_info, {:ok, %{"balanceSat" => 750_000}})

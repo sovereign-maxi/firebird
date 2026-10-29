@@ -906,7 +906,7 @@ defmodule FireBird.Executor do
         apply_preimage(state, payment, preimage, fee_sats, phoenixd_id)
 
       :error ->
-        state
+        handle_unknown_outcome(state, payment, :invalid_preimage_encoding)
     end
   end
 

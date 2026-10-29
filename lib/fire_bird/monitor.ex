@@ -34,7 +34,8 @@ defmodule FireBird.Monitor do
     :low_watermark,
     :critical_watermark,
     :timer_ref,
-    liquidity_state: :normal
+    liquidity_state: :normal,
+    poll_generation: 0
   ]
 
   @default_poll_interval 30_000
@@ -54,6 +55,15 @@ defmodule FireBird.Monitor do
   def get_balance(table_name \\ __MODULE__) do
     case :ets.lookup(table_name, :balance) do
       [{:balance, sats}] -> {:ok, sats}
+      [] -> {:error, :not_found}
+    end
+  end
+
+  @doc "Returns the current inbound liquidity from ETS."
+  @spec get_inbound_liquidity(atom()) :: {:ok, non_neg_integer()} | {:error, :not_found}
+  def get_inbound_liquidity(table_name \\ __MODULE__) do
+    case :ets.lookup(table_name, :inbound_liquidity) do
+      [{:inbound_liquidity, sats}] -> {:ok, sats}
       [] -> {:error, :not_found}
     end
   end
@@ -108,6 +118,10 @@ defmodule FireBird.Monitor do
   end
 
   defp poll_balance(state) do
+    generation = state.poll_generation + 1
+    state = %{state | poll_generation: generation}
+    :telemetry.execute([:fire_bird, :liquidity, :poll_start], %{}, %{generation: generation})
+
     case state.client_mod.get_info(state.client_config) do
       {:ok, info} ->
         case Info.channel_balance_sats(info) do
@@ -118,7 +132,7 @@ defmodule FireBird.Monitor do
             :telemetry.execute(
               [:fire_bird, :liquidity, :poll],
               %{balance_sats: balance_sats},
-              %{state: state.liquidity_state}
+              %{state: state.liquidity_state, generation: generation}
             )
 
             check_thresholds(state, balance_sats)

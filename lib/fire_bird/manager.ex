@@ -212,12 +212,14 @@ defmodule FireBird.Manager do
       {:ok, received} when received >= invoice.amount_sats ->
         confirm_payment(state, invoice, preimage_hex, received)
 
-      {:ok, received} ->
+      {:ok, received} when received > 0 ->
         Logger.warning(
           "Manager: underpaid invoice " <>
             "#{Base.encode16(invoice.payment_hash, case: :lower)} — " <>
-            "received #{received} sats, expected #{invoice.amount_sats}"
+            "received #{received} sats, expected #{invoice.amount_sats}; accounting for actual receipts"
         )
+
+        confirm_payment(state, invoice, preimage_hex, received)
 
       :unknown ->
         # `receivedSat` absent from phoenixd response. Fail closed —

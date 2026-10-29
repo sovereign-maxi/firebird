@@ -146,6 +146,26 @@ defmodule FireBird.ExecutorTest do
                       }},
                      1_000
     end
+
+    test "malformed preimage encoding enters unknown-outcome reconciliation", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment()
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_invoice,
+        {:ok, %{"paymentPreimage" => "not-hex", "routingFeeSat" => 0}}
+      )
+
+      Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment,
+                      %FireBird.Events.PaymentUnknown{
+                        payment_hash: _,
+                        reason: ":invalid_preimage_encoding"
+                      }},
+                     1_000
+    end
   end
 
   describe "failure and retry (retryable errors)" do
