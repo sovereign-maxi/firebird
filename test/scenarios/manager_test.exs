@@ -63,6 +63,7 @@ defmodule FireBird.ManagerTest do
     test "expired invoice publishes InvoiceExpired and updates ETS", ctx do
       invoice = build_test_invoice(expires_at: DateTime.add(DateTime.utc_now(), -1, :second))
       Manager.track(ctx.pid, invoice)
+      MockClient.set_response(ctx.client, :get_incoming_payment, {:ok, %{"isPaid" => false}})
       Registry.register(ctx.pubsub, :invoice, [])
 
       send(ctx.pid, :poll)
@@ -467,6 +468,7 @@ defmodule FireBird.ManagerTest do
       # Create and expire an invoice
       invoice = build_test_invoice(expires_at: DateTime.add(DateTime.utc_now(), -1, :second))
       Manager.track(ctx.pid, invoice)
+      MockClient.set_response(ctx.client, :get_incoming_payment, {:ok, %{"isPaid" => false}})
 
       send(ctx.pid, :poll)
       :sys.get_state(ctx.pid)

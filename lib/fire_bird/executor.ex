@@ -194,8 +194,8 @@ defmodule FireBird.Executor do
           :pending
 
         {:error, {:http_error, 404, _body}} ->
-          # No outgoing record — the attempt never reached the node.
-          :failed
+          # Node history may be incomplete after a restore. Absence is not proof of failure.
+          :unknown
 
         {:error, _lookup_failure} ->
           :unknown
@@ -731,8 +731,8 @@ defmodule FireBird.Executor do
         :unknown
 
       {:error, {:http_error, 404, _body}} ->
-        # No outgoing record at all — the payment was never attempted.
-        :definitive
+        # Node history may be incomplete after a restore. Absence is not proof of failure.
+        :unknown
 
       {:error, _lookup_failure} ->
         :unknown

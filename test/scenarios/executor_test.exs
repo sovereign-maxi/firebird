@@ -310,7 +310,7 @@ defmodule FireBird.ExecutorTest do
       refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 200
     end
 
-    test "unknown reason strings fall through to :definitive (fail-closed)", ctx do
+    test "unknown reason strings remain ambiguous (fail-closed)", ctx do
       Registry.register(ctx.pubsub, :payment, [])
       payment = build_test_payment(max_attempts: 3)
 
@@ -322,9 +322,8 @@ defmodule FireBird.ExecutorTest do
 
       Executor.submit(ctx.pid, payment)
 
-      # Unknown reasons release the reservation rather than pinning
-      # it in an unknown loop.
-      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 1_000
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 200
     end
   end
 
@@ -353,13 +352,12 @@ defmodule FireBird.ExecutorTest do
       assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
     end
 
-    test "4xx with no node-side payment record publishes PaymentExhausted", ctx do
+    test "4xx with missing node history remains ambiguous", ctx do
       Registry.register(ctx.pubsub, :payment, [])
       payment = build_test_payment(max_attempts: 3)
 
       MockClient.set_response(ctx.client, :pay_invoice, {:error, {:http_error, 400, "Bad Request"}})
-      # The 4xx confirmation lookup finds no settled payment on the
-      # node — releasing the reservation is provably safe.
+
       MockClient.set_response(
         ctx.client,
         :get_outgoing_payment_by_hash,
@@ -368,10 +366,8 @@ defmodule FireBird.ExecutorTest do
 
       Executor.submit(ctx.pid, payment)
 
-      # Definitive-failure release path — one Exhausted event, no
-      # Failed/retry ladder.
-      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 1_000
-      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 200
+      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+      refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 200
     end
 
     test "4xx but node shows payment SETTLED publishes PaymentUnknown, never releases", ctx do
@@ -433,7 +429,7 @@ defmodule FireBird.ExecutorTest do
       assert :failed = Executor.confirm_against_node(ctx.pid, hash)
     end
 
-    test ":failed when the node has no outgoing record (404)", ctx do
+    test ":unknown when the node has no outgoing record (404)", ctx do
       hash = :crypto.strong_rand_bytes(32)
 
       MockClient.set_response(
@@ -442,7 +438,7 @@ defmodule FireBird.ExecutorTest do
         {:error, {:http_error, 404, "not found"}}
       )
 
-      assert :failed = Executor.confirm_against_node(ctx.pid, hash)
+      assert :unknown = Executor.confirm_against_node(ctx.pid, hash)
     end
 
     test ":pending when the node shows an in-flight record", ctx do
@@ -1278,12 +1274,11 @@ defmodule FireBird.ExecutorTest do
         {:error, {:http_error, 400, "bad invoice"}}
       )
 
-      # 4xx outcomes are confirmed against the node before release:
-      # a 404 on the lookup means no payment record — definitive.
+      # A positive terminal-nonsettled node record permits release.
       MockClient.set_response(
         client_name,
         :get_outgoing_payment_by_hash,
-        {:error, {:http_error, 404, "not found"}}
+        {:ok, %{"isPaid" => false, "completedAt" => "2026-10-01T00:00:00Z"}}
       )
 
       pid =

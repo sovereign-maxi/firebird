@@ -108,7 +108,10 @@ defmodule FireBird.Manager do
 
   @impl GenServer
   def handle_call({:track, invoice}, _from, state) do
-    :ets.insert(state.table_name, {invoice.payment_hash, invoice})
+    case :ets.lookup(state.table_name, invoice.payment_hash) do
+      [{_hash, %Invoice{status: :paid}}] -> :ok
+      _other -> :ets.insert(state.table_name, {invoice.payment_hash, invoice})
+    end
 
     :telemetry.execute(
       [:fire_bird, :invoice, :tracked],
@@ -168,16 +171,19 @@ defmodule FireBird.Manager do
   end
 
   defp check_invoice(state, invoice) do
-    # Poll first: a payment settling in the final window before expiry
-    # must be confirmed — expiring first would strand a paid invoice.
-    poll_payment_status(state, invoice)
+    # A transport failure is not proof of nonpayment and must not expire
+    # the only live binding for a payment racing the invoice deadline.
+    case poll_payment_status(state, invoice) do
+      :ok ->
+        case :ets.lookup(state.table_name, invoice.payment_hash) do
+          [{_key, %Invoice{status: :pending} = current}] ->
+            if Invoice.expired?(current), do: expire_invoice(state, current)
 
-    # Re-read: the poll may have just confirmed the payment.
-    case :ets.lookup(state.table_name, invoice.payment_hash) do
-      [{_key, %Invoice{status: :pending} = current}] ->
-        if Invoice.expired?(current), do: expire_invoice(state, current)
+          _other ->
+            :ok
+        end
 
-      _other ->
+      :error ->
         :ok
     end
   end
@@ -204,6 +210,8 @@ defmodule FireBird.Manager do
             "#{Base.encode16(invoice.payment_hash, case: :lower)} " <>
             "failed: #{inspect(reason)}"
         )
+
+        :error
     end
   end
 

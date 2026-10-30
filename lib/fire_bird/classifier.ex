@@ -13,9 +13,10 @@ defmodule FireBird.Classifier do
   is self-contained here so `FireBird.Executor` doesn't need to pull
   the `String` module into its already-dense alias set.
 
-  Unknown reasons fall through to `:definitive` so a stuck payment
-  releases its reservation instead of looping on a retry ladder
-  against a condition that may be permanent.
+  Unknown reasons fall through to `:connection_ambiguous` because an
+  unrecognized reason is not positive proof that the payment did not
+  settle. The reconciler must obtain a terminal node-side outcome
+  before releasing any reservation.
   """
 
   @typedoc """
@@ -54,12 +55,14 @@ defmodule FireBird.Classifier do
         # drives it off the authoritative node view.
         :connection_ambiguous
 
-      true ->
-        # Everything else (invoice expired, already paid, insufficient
-        # funds, fees too high, aborted, wallet restart) — definitive.
+      String.contains?(lowered, "insufficientbalance") ->
         :definitive
+
+      true ->
+        # Unrecognized reasons are not positive proof of non-settlement.
+        :connection_ambiguous
     end
   end
 
-  def classify(_other), do: :definitive
+  def classify(_other), do: :connection_ambiguous
 end
