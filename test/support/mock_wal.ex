@@ -31,18 +31,27 @@ defmodule FireBird.MockWAL do
   @doc "When enabled, append/2 fails with {:error, :disk_full}."
   @spec set_fail_appends(GenServer.server(), boolean()) :: :ok
   def set_fail_appends(name \\ __MODULE__, flag) do
-    Agent.update(name, &Map.put(&1, :fail_appends, flag))
+    failure = if flag, do: {:error, :disk_full}, else: false
+    Agent.update(name, &Map.put(&1, :fail_appends, failure))
+  end
+
+  @doc "Makes append/2 return {:error, reason} without recording an entry."
+  @spec set_append_error(GenServer.server(), term()) :: :ok
+  def set_append_error(name \\ __MODULE__, reason) do
+    Agent.update(name, &Map.put(&1, :fail_appends, {:error, reason}))
   end
 
   @impl FireBird.WAL
   def append(config, entry) do
     name = resolve_name(config)
 
-    if Agent.get(name, & &1.fail_appends) do
-      {:error, :disk_full}
-    else
-      Agent.update(name, &%{&1 | entries: &1.entries ++ [entry]})
-      :ok
+    case Agent.get(name, & &1.fail_appends) do
+      false ->
+        Agent.update(name, &%{&1 | entries: &1.entries ++ [entry]})
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

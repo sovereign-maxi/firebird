@@ -47,8 +47,9 @@ defmodule FireBird.Manager do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @doc "Registers an invoice for lifecycle tracking."
-  @spec track(GenServer.server(), Invoice.t(), timeout()) :: :ok
+  @doc "Registers an invoice for lifecycle tracking without replacing another invoice's identity."
+  @spec track(GenServer.server(), Invoice.t(), timeout()) ::
+          :ok | {:error, {:duplicate, String.t() | nil}}
   def track(server, %Invoice{} = invoice, timeout \\ 5_000) do
     GenServer.call(server, {:track, invoice}, timeout)
   end
@@ -108,18 +109,33 @@ defmodule FireBird.Manager do
 
   @impl GenServer
   def handle_call({:track, invoice}, _from, state) do
-    case :ets.lookup(state.table_name, invoice.payment_hash) do
-      [{_hash, %Invoice{status: :paid}}] -> :ok
-      _other -> :ets.insert(state.table_name, {invoice.payment_hash, invoice})
+    result =
+      case :ets.lookup(state.table_name, invoice.payment_hash) do
+        [{_hash, %Invoice{external_id: external_id, status: existing_status}}]
+        when external_id == invoice.external_id ->
+          if invoice.status == :pending and existing_status != :paid do
+            :ets.insert(state.table_name, {invoice.payment_hash, invoice})
+          end
+
+          :ok
+
+        [{_hash, %Invoice{external_id: external_id}}] ->
+          {:error, {:duplicate, external_id}}
+
+        [] ->
+          :ets.insert(state.table_name, {invoice.payment_hash, invoice})
+          :ok
+      end
+
+    if result == :ok do
+      :telemetry.execute(
+        [:fire_bird, :invoice, :tracked],
+        %{count: 1},
+        %{amount_sats: invoice.amount_sats}
+      )
     end
 
-    :telemetry.execute(
-      [:fire_bird, :invoice, :tracked],
-      %{count: 1},
-      %{amount_sats: invoice.amount_sats}
-    )
-
-    {:reply, :ok, state}
+    {:reply, result, state}
   end
 
   @impl GenServer
@@ -270,7 +286,8 @@ defmodule FireBird.Manager do
         payment_hash: invoice.payment_hash,
         amount_sats: invoice.amount_sats,
         received_sats: received_sats,
-        paid_at: paid_invoice.paid_at
+        paid_at: paid_invoice.paid_at,
+        external_id: invoice.external_id
       })
 
       :telemetry.execute(
@@ -295,7 +312,8 @@ defmodule FireBird.Manager do
         PubSub.publish(state.pubsub, :invoice, %InvoiceExpired{
           payment_hash: invoice.payment_hash,
           amount_sats: invoice.amount_sats,
-          expired_at: DateTime.utc_now()
+          expired_at: DateTime.utc_now(),
+          external_id: invoice.external_id
         })
 
         :telemetry.execute(

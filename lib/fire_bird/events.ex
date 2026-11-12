@@ -24,13 +24,14 @@ defmodule FireBird.Events do
     """
 
     @enforce_keys [:payment_hash, :amount_sats, :received_sats, :paid_at]
-    defstruct [:payment_hash, :amount_sats, :received_sats, :paid_at, version: 1]
+    defstruct [:payment_hash, :amount_sats, :received_sats, :paid_at, :external_id, version: 1]
 
     @type t :: %__MODULE__{
             payment_hash: binary(),
             amount_sats: pos_integer(),
             received_sats: pos_integer(),
             paid_at: DateTime.t(),
+            external_id: String.t() | nil,
             version: pos_integer()
           }
   end
@@ -39,12 +40,13 @@ defmodule FireBird.Events do
     @moduledoc "Emitted when a pending invoice passes its expiration time."
 
     @enforce_keys [:payment_hash, :amount_sats, :expired_at]
-    defstruct [:payment_hash, :amount_sats, :expired_at, version: 1]
+    defstruct [:payment_hash, :amount_sats, :expired_at, :external_id, version: 1]
 
     @type t :: %__MODULE__{
             payment_hash: binary(),
             amount_sats: pos_integer(),
             expired_at: DateTime.t(),
+            external_id: String.t() | nil,
             version: pos_integer()
           }
   end
@@ -53,13 +55,25 @@ defmodule FireBird.Events do
     @moduledoc "Emitted when an outbound payment succeeds."
 
     @enforce_keys [:payment_hash, :amount_sats, :fee_sats, :preimage]
-    defstruct [:payment_hash, :amount_sats, :fee_sats, :preimage, version: 1]
+    defstruct [
+      :payment_hash,
+      :amount_sats,
+      :fee_sats,
+      :preimage,
+      :external_id,
+      :generation,
+      :description,
+      version: 1
+    ]
 
     @type t :: %__MODULE__{
             payment_hash: binary(),
             amount_sats: pos_integer(),
             fee_sats: non_neg_integer(),
             preimage: binary(),
+            external_id: String.t() | nil,
+            generation: String.t() | nil,
+            description: String.t() | nil,
             version: pos_integer()
           }
 
@@ -78,13 +92,23 @@ defmodule FireBird.Events do
     @moduledoc "Emitted when a payment attempt fails but may be retried."
 
     @enforce_keys [:payment_hash, :amount_sats, :reason, :attempt]
-    defstruct [:payment_hash, :amount_sats, :reason, :attempt, version: 1]
+    defstruct [
+      :payment_hash,
+      :amount_sats,
+      :reason,
+      :attempt,
+      :external_id,
+      :generation,
+      version: 1
+    ]
 
     @type t :: %__MODULE__{
             payment_hash: binary(),
             amount_sats: pos_integer(),
             reason: String.t(),
             attempt: pos_integer(),
+            external_id: String.t() | nil,
+            generation: String.t() | nil,
             version: pos_integer()
           }
   end
@@ -93,34 +117,46 @@ defmodule FireBird.Events do
     @moduledoc "Emitted when a payment exhausts all retry attempts."
 
     @enforce_keys [:payment_hash, :amount_sats, :reason, :attempts]
-    defstruct [:payment_hash, :amount_sats, :reason, :attempts, version: 1]
+    defstruct [
+      :payment_hash,
+      :amount_sats,
+      :reason,
+      :attempts,
+      :external_id,
+      :generation,
+      version: 1
+    ]
 
     @type t :: %__MODULE__{
             payment_hash: binary(),
             amount_sats: pos_integer(),
             reason: String.t(),
             attempts: pos_integer(),
+            external_id: String.t() | nil,
+            generation: String.t() | nil,
             version: pos_integer()
           }
   end
 
   defmodule PaymentUnknown do
     @moduledoc """
-    Emitted when a payment's Lightning outcome is undetermined —
-    HTTP timeout, transport error, task crash, or ambiguous 5xx from
-    the node. The payment MAY still settle. Consumers MUST NOT
-    release the caller's reservation on this event; instead they
-    should transition their local state to a fail-closed "settlement
-    unknown" and reconcile with the node before any further action.
-
-    `phoenixd_id` is included when we captured it before the
-    ambiguous event (e.g. we processed the /payinvoice response but
-    then crashed on the follow-up bookkeeping). Nil when we never
-    got a response back.
+    Emitted when a payment's Lightning outcome is undetermined.
+    Consumers MUST retain reservations and reconcile the immutable
+    `external_id` / `generation` attempt, not whichever payment hash
+    happens to be current.
     """
 
     @enforce_keys [:payment_hash, :amount_sats, :reason, :attempt]
-    defstruct [:payment_hash, :amount_sats, :reason, :attempt, :phoenixd_id, version: 1]
+    defstruct [
+      :payment_hash,
+      :amount_sats,
+      :reason,
+      :attempt,
+      :phoenixd_id,
+      :external_id,
+      :generation,
+      version: 1
+    ]
 
     @type t :: %__MODULE__{
             payment_hash: binary(),
@@ -128,6 +164,8 @@ defmodule FireBird.Events do
             reason: String.t(),
             attempt: pos_integer(),
             phoenixd_id: String.t() | nil,
+            external_id: String.t() | nil,
+            generation: String.t() | nil,
             version: pos_integer()
           }
   end

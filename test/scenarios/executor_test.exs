@@ -93,7 +93,14 @@ defmodule FireBird.ExecutorTest do
   describe "success flow" do
     test "publishes PaymentSent event", ctx do
       Registry.register(ctx.pubsub, :payment, [])
-      payment = build_test_payment()
+
+      payment =
+        build_test_payment(
+          external_id: "reservation:attempt-a",
+          description: "arcade-withdrawal fee=10",
+          created_at: ~U[2026-01-01 00:00:00.000000Z]
+        )
+
       preimage = :crypto.strong_rand_bytes(32)
       preimage_hex = Base.encode16(preimage, case: :lower)
 
@@ -108,11 +115,15 @@ defmodule FireBird.ExecutorTest do
       assert_receive {FireBird.PubSub, :payment,
                       %FireBird.Events.PaymentSent{
                         payment_hash: payment_hash,
-                        fee_sats: 5
+                        fee_sats: 5,
+                        external_id: "reservation:attempt-a",
+                        generation: generation,
+                        description: "arcade-withdrawal fee=10"
                       }},
                      1_000
 
       assert payment_hash == payment.payment_hash
+      assert generation == "reservation:attempt-a:2026-01-01T00:00:00.000000Z"
     end
   end
 
@@ -865,6 +876,9 @@ defmodule FireBird.ExecutorTest do
       :sys.get_state(pid)
 
       assert {:error, :not_found} = Executor.lookup(table, payment.payment_hash)
+
+      assert {:error, {:duplicate, {:already_terminal, :succeeded}}} =
+               Executor.submit(pid, payment)
     end
 
     test "retains succeeded payments within retention period" do
@@ -1096,7 +1110,41 @@ defmodule FireBird.ExecutorTest do
       assert MockClient.calls(client_name, :pay_invoice) == []
     end
 
-    test "recovery skips resolved payments, revives in-flight and retrying" do
+    test "ambiguous WAL result is preserved and never dispatched as a definitive refusal" do
+      n = System.unique_integer([:positive])
+      table = :"wal_ambiguous_#{n}"
+      pubsub = :"wal_ambiguous_pubsub_#{n}"
+      client_name = :"wal_ambiguous_client_#{n}"
+      wal_name = :"wal_ambiguous_agent_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+      start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+      MockWAL.set_append_error(wal_name, {:ambiguous_write, :post_write_fsync_unknown})
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             wal: {MockWAL, wal_name},
+             name: :"wal_ambiguous_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      payment = build_test_payment(external_id: "reservation:ambiguous")
+
+      assert {:error, {:ambiguous_write, :post_write_fsync_unknown}} =
+               Executor.submit(pid, payment)
+
+      assert {:error, :not_found} = Executor.lookup(table, payment.payment_hash)
+      assert MockClient.calls(client_name, :pay_invoice) == []
+    end
+
+    test "recovery restores terminal payments and revives in-flight and retrying" do
       n = System.unique_integer([:positive])
       table = :"wal_rec_#{n}"
       pubsub = :"wal_rec_pubsub_#{n}"
@@ -1106,8 +1154,9 @@ defmodule FireBird.ExecutorTest do
       start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
       start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
       start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+      Registry.register(pubsub, :payment, [])
 
-      resolved = build_test_payment()
+      resolved = build_test_payment(external_id: "reservation:recovered")
       MockWAL.append(wal_name, %{resolved | status: :in_flight, attempt: 1})
       MockWAL.append(wal_name, %{resolved | status: :succeeded, attempt: 1})
 
@@ -1118,26 +1167,37 @@ defmodule FireBird.ExecutorTest do
       MockWAL.append(wal_name, %{already_unknown | status: :in_flight, attempt: 1})
       MockWAL.append(wal_name, %{already_unknown | status: :unknown, attempt: 1})
 
-      start_supervised!(
-        {Executor,
-         [
-           client: {MockClient, client_name},
-           pubsub: pubsub,
-           table_name: table,
-           max_concurrent: 10,
-           wal: {MockWAL, wal_name},
-           name: :"wal_rec_srv_#{n}"
-         ]},
-        id: {Executor, n}
-      )
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 10,
+             wal: {MockWAL, wal_name},
+             name: :"wal_rec_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
 
       FireBirdHelpers.await_condition(fn ->
         match?({:ok, %{status: :unknown}}, Executor.lookup(table, wedged.payment_hash))
       end)
 
-      assert {:error, :not_found} = Executor.lookup(table, resolved.payment_hash)
+      assert {:ok, %{status: :succeeded}} = Executor.lookup(table, resolved.payment_hash)
       assert {:ok, %{status: :unknown}} = Executor.lookup(table, wedged.payment_hash)
-      assert {:error, :not_found} = Executor.lookup(table, already_unknown.payment_hash)
+      assert {:ok, %{status: :unknown}} = Executor.lookup(table, already_unknown.payment_hash)
+
+      assert {:error, {:duplicate, {:already_terminal, :succeeded}}} =
+               Executor.submit(pid, resolved)
+
+      send(pid, :replay_terminal)
+
+      assert_receive {FireBird.PubSub, :payment,
+                      %FireBird.Events.PaymentSent{external_id: "reservation:recovered"}},
+                     1_000
+
       assert MockClient.calls(client_name, :pay_invoice) == []
     end
 
@@ -1311,6 +1371,87 @@ defmodule FireBird.ExecutorTest do
     end
   end
 
+  describe "recovery and invalid-invoice regressions" do
+    test "retry-time WAL failure emits one identity-correct unknown outcome" do
+      n = System.unique_integer([:positive])
+      table = :"retry_wal_#{n}"
+      pubsub = :"retry_wal_pubsub_#{n}"
+      client_name = :"retry_wal_client_#{n}"
+      wal_name = :"retry_wal_agent_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: {MockClient, client_name})
+      start_supervised!({MockWAL, name: wal_name}, id: wal_name)
+      Registry.register(pubsub, :payment, [])
+
+      MockClient.set_response(
+        client_name,
+        :pay_invoice,
+        {:error, {:phoenixd_error, :route_not_found, "no route"}}
+      )
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             wal: {MockWAL, wal_name},
+             name: :"retry_wal_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      payment = build_test_payment(external_id: "reservation:retry-wal")
+      assert :ok = Executor.submit(pid, payment)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :retrying}}, Executor.lookup(table, payment.payment_hash))
+      end)
+
+      MockWAL.set_fail_appends(wal_name, true)
+      send(pid, {:retry, payment.payment_hash})
+
+      assert_receive {FireBird.PubSub, :payment,
+                      %FireBird.Events.PaymentUnknown{
+                        payment_hash: hash,
+                        external_id: "reservation:retry-wal",
+                        generation: generation,
+                        attempt: 2
+                      }},
+                     1_000
+
+      assert hash == payment.payment_hash
+      assert String.starts_with?(generation, "reservation:retry-wal:")
+      assert {:ok, %{status: :unknown, attempt: 2}} = Executor.lookup(table, hash)
+    end
+
+    test "explicit invalid invoice is terminal without consulting incomplete node history", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      payment = build_test_payment(external_id: "reservation:invalid")
+
+      MockClient.set_response(
+        ctx.client,
+        :pay_invoice,
+        {:error, {:http_error, 400, "invalid invoice: bad checksum"}}
+      )
+
+      assert :ok = Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment,
+                      %FireBird.Events.PaymentExhausted{
+                        payment_hash: hash,
+                        external_id: "reservation:invalid"
+                      }},
+                     1_000
+
+      assert hash == payment.payment_hash
+      assert {:ok, %{status: :failed}} = Executor.lookup(ctx.table, hash)
+      assert MockClient.calls(ctx.client, :get_outgoing_payment_by_hash) == []
+    end
+  end
+
   describe "push payments — :offer destination" do
     test "dispatches to pay_offer and stores in ETS as succeeded", ctx do
       payment = build_offer_payment()
@@ -1452,7 +1593,9 @@ defmodule FireBird.ExecutorTest do
       payment_hash: payment_hash,
       bolt11: "lnbc1000u1ptest#{Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)}",
       amount_sats: Keyword.get(opts, :amount_sats, 1_000),
-      created_at: DateTime.utc_now(),
+      created_at: Keyword.get(opts, :created_at, DateTime.utc_now()),
+      external_id: Keyword.get(opts, :external_id),
+      description: Keyword.get(opts, :description),
       max_attempts: Keyword.get(opts, :max_attempts, 3)
     )
   end

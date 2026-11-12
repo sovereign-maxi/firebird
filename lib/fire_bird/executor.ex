@@ -39,13 +39,17 @@ defmodule FireBird.Executor do
     :retention_ms,
     :cleanup_interval,
     :cleanup_timer_ref,
+    :terminal_replay_interval,
+    :terminal_replay_timer_ref,
     tasks: %{},
-    retry_timers: %{}
+    retry_timers: %{},
+    succeeded_hashes: %{}
   ]
 
   @default_max_concurrent 10
   @default_retention_ms 86_400_000
   @default_cleanup_interval 3_600_000
+  @default_terminal_replay_interval 30_000
 
   # Non-terminal statuses in which a duplicate submit is rejected —
   # accepting one would spawn a second `pay_invoice` task for the
@@ -71,13 +75,16 @@ defmodule FireBird.Executor do
   acceptance, `{:error, :at_capacity}` when the max-concurrent
   ceiling is hit, or `{:error, {:duplicate, reason}}` when a
   payment with the same `payment_hash` already sits in a state
-  that refuses re-submission (see `@active_dedup_statuses` and
-  `@terminal_dedup_statuses`).
+  that refuses re-submission. `:wal_unavailable` is a definitive
+  pre-dispatch refusal; `{:ambiguous_write, reason}` requires WAL
+  reconciliation and is never a safe-release signal.
   """
   @spec submit(GenServer.server(), Payment.t(), timeout()) ::
           :ok
           | {:error, :at_capacity}
           | {:error, {:duplicate, atom()}}
+          | {:error, :wal_unavailable}
+          | {:error, {:ambiguous_write, term()}}
   def submit(server, %Payment{} = payment, timeout \\ 5_000) do
     GenServer.call(server, {:submit, payment}, timeout)
   end
@@ -134,6 +141,9 @@ defmodule FireBird.Executor do
     retention_ms = Keyword.get(opts, :retention_ms, @default_retention_ms)
     cleanup_interval = Keyword.get(opts, :cleanup_interval, @default_cleanup_interval)
 
+    terminal_replay_interval =
+      Keyword.get(opts, :terminal_replay_interval, @default_terminal_replay_interval)
+
     if is_nil(wal) do
       Logger.warning(
         "Executor: started without WAL — " <>
@@ -143,7 +153,7 @@ defmodule FireBird.Executor do
 
     :ets.new(table_name, [:named_table, :set, :public, read_concurrency: true])
 
-    recovered_timers = recover_from_wal(wal, table_name, pubsub)
+    {recovered_timers, succeeded_hashes} = recover_from_wal(wal, table_name, pubsub)
 
     state = %__MODULE__{
       client_mod: client_mod,
@@ -155,11 +165,20 @@ defmodule FireBird.Executor do
       liquidity_table: liquidity_table,
       retention_ms: retention_ms,
       cleanup_interval: cleanup_interval,
-      retry_timers: recovered_timers
+      terminal_replay_interval: terminal_replay_interval,
+      retry_timers: recovered_timers,
+      succeeded_hashes: succeeded_hashes
     }
 
     cleanup_timer_ref = schedule_cleanup(cleanup_interval)
-    {:ok, %{state | cleanup_timer_ref: cleanup_timer_ref}}
+    terminal_replay_timer_ref = schedule_terminal_replay(terminal_replay_interval)
+
+    {:ok,
+     %{
+       state
+       | cleanup_timer_ref: cleanup_timer_ref,
+         terminal_replay_timer_ref: terminal_replay_timer_ref
+     }}
   end
 
   @impl GenServer
@@ -168,7 +187,8 @@ defmodule FireBird.Executor do
       map_size(state.tasks) >= state.max_concurrent ->
         {:reply, {:error, :at_capacity}, state}
 
-      duplicate_reason = duplicate_submit_reason(state.table_name, payment.payment_hash) ->
+      duplicate_reason =
+          duplicate_submit_reason(state.table_name, payment.payment_hash, state.succeeded_hashes) ->
         {:reply, {:error, {:duplicate, duplicate_reason}}, state}
 
       true ->
@@ -209,7 +229,15 @@ defmodule FireBird.Executor do
   # per-invoice idempotency gate, distinct from the WAL's crash-
   # recovery replay path. Returns nil (fresh submit allowed) or the
   # atom describing the existing state.
-  defp duplicate_submit_reason(table_name, payment_hash) do
+  defp duplicate_submit_reason(table_name, payment_hash, succeeded_hashes) do
+    if Map.has_key?(succeeded_hashes, payment_hash) do
+      {:already_terminal, :succeeded}
+    else
+      duplicate_submit_reason_from_table(table_name, payment_hash)
+    end
+  end
+
+  defp duplicate_submit_reason_from_table(table_name, payment_hash) do
     case :ets.lookup(table_name, payment_hash) do
       [{^payment_hash, %Payment{status: status}}]
       when status in @in_flight_statuses ->
@@ -263,15 +291,26 @@ defmodule FireBird.Executor do
             {:noreply, state}
 
           {:error, _wal_reason, state} ->
-            # Can't pay durably while the WAL is down — fail closed to
-            # :unknown so the caller reconciles instead of the payment
-            # wedging in :retrying with no timer left.
-            {:noreply, handle_unknown_outcome(state, payment, "wal_unavailable_on_retry")}
+            in_flight = %{payment | status: :in_flight, attempt: payment.attempt + 1}
+            {:noreply, handle_unknown_outcome(state, in_flight, "wal_unavailable_on_retry")}
         end
 
       _other ->
         {:noreply, state}
     end
+  end
+
+  def handle_info(:replay_terminal, state) do
+    state.table_name
+    |> :ets.tab2list()
+    |> Enum.each(fn {_hash, payment} ->
+      if payment.status in [:succeeded, :failed, :exhausted] do
+        publish_terminal_payment(state.pubsub, payment)
+      end
+    end)
+
+    timer_ref = schedule_terminal_replay(state.terminal_replay_interval)
+    {:noreply, %{state | terminal_replay_timer_ref: timer_ref}}
   end
 
   def handle_info(:cleanup, state) do
@@ -297,6 +336,7 @@ defmodule FireBird.Executor do
   @impl GenServer
   def terminate(_reason, state) do
     if state.cleanup_timer_ref, do: Process.cancel_timer(state.cleanup_timer_ref)
+    if state.terminal_replay_timer_ref, do: Process.cancel_timer(state.terminal_replay_timer_ref)
     Enum.each(state.retry_timers, fn {_hash, ref} -> Process.cancel_timer(ref) end)
 
     case state.wal do
@@ -322,43 +362,40 @@ defmodule FireBird.Executor do
     :ok
   end
 
-  defp recover_from_wal(nil, _table_name, _pubsub), do: %{}
+  defp recover_from_wal(nil, _table_name, _pubsub), do: {%{}, %{}}
 
   defp recover_from_wal({wal_mod, wal_config}, table_name, pubsub) do
     case wal_mod.recover(wal_config) do
       {:ok, payments} when is_list(payments) ->
-        # Last record per payment_hash wins (recover/1 returns append
-        # order, oldest first). Payments whose final record is terminal
-        # (:succeeded / :exhausted / :failed) or already fail-closed
-        # (:unknown) are resolved — only :in_flight / :retrying revive.
-        revivable =
+        payments = Enum.filter(payments, &match?(%Payment{}, &1))
+
+        succeeded_hashes =
           payments
-          |> Enum.filter(&match?(%Payment{}, &1))
+          |> Enum.filter(&(&1.status == :succeeded))
+          |> Map.new(&{&1.payment_hash, true})
+
+        latest =
+          payments
           |> Enum.group_by(& &1.payment_hash)
           |> Enum.map(fn {_hash, records} -> List.last(records) end)
-          |> Enum.filter(&(&1.status in [:in_flight, :retrying]))
 
-        count = length(revivable)
+        Enum.each(latest, fn payment ->
+          case payment.status do
+            status when status in [:in_flight, :retrying] ->
+              recover_single(payment, table_name, pubsub)
 
-        if count > 0 do
-          Logger.warning(
-            "Executor: recovering in-flight payments from WAL, " <>
-              "marking each :unknown, caller must reconcile before releasing, count=#{count}"
-          )
-        end
+            status when status in [:succeeded, :failed, :exhausted, :unknown] ->
+              :ets.insert(table_name, {payment.payment_hash, payment})
 
-        Enum.each(revivable, fn payment -> recover_single(payment, table_name, pubsub) end)
+            _other ->
+              :ok
+          end
+        end)
 
-        # No retry timers: recovered payments are ambiguous by
-        # definition (the VM crashed while the phoenixd task was in
-        # flight) and must be reconciled against the node before any
-        # further action. Never auto-retry a payment whose Lightning
-        # outcome is undetermined — that's the double-pay path.
-        %{}
+        {%{}, succeeded_hashes}
 
       {:error, reason} ->
-        Logger.error("Executor: WAL recovery failed: #{inspect(reason)}")
-        %{}
+        raise "FireBird.Executor WAL recovery failed: #{inspect(reason)}"
     end
   end
 
@@ -385,7 +422,9 @@ defmodule FireBird.Executor do
       amount_sats: payment.amount_sats,
       reason: reason,
       attempt: payment.attempt,
-      phoenixd_id: payment.phoenixd_id
+      phoenixd_id: payment.phoenixd_id,
+      external_id: payment.external_id,
+      generation: payment_generation(payment)
     })
 
     :telemetry.execute(
@@ -428,7 +467,13 @@ defmodule FireBird.Executor do
               "Executor: refusing to dispatch payment — WAL append failed: #{inspect(reason)}"
             )
 
-            {:error, :wal_unavailable, state}
+            error =
+              case reason do
+                {:ambiguous_write, _reason} = ambiguous -> ambiguous
+                _other -> :wal_unavailable
+              end
+
+            {:error, error, state}
         end
 
       {:error, _reason} ->
@@ -634,11 +679,15 @@ defmodule FireBird.Executor do
   # 4xx errors get a node-side confirmation before classification:
   # "already paid" must never release, everything else may. 408/429
   # stay hard-:unknown — the node may still be processing.
-  defp process_result(state, payment, {:error, {:http_error, status, _body} = reason})
+  defp process_result(state, payment, {:error, {:http_error, status, body} = reason})
        when status >= 400 and status < 500 and status not in [408, 429] do
-    case confirm_4xx_outcome(state, payment) do
-      :definitive -> handle_definitive_failure(state, payment, reason)
-      :unknown -> handle_unknown_outcome(state, payment, reason)
+    if Classifier.invalid_invoice?(body) do
+      handle_definitive_failure(state, payment, {:invalid_invoice, body})
+    else
+      case confirm_4xx_outcome(state, payment) do
+        :definitive -> handle_definitive_failure(state, payment, reason)
+        :unknown -> handle_unknown_outcome(state, payment, reason)
+      end
     end
   end
 
@@ -796,7 +845,9 @@ defmodule FireBird.Executor do
           payment_hash: payment.payment_hash,
           amount_sats: payment.amount_sats,
           reason: reason_str,
-          attempt: retrying.attempt
+          attempt: retrying.attempt,
+          external_id: payment.external_id,
+          generation: payment_generation(payment)
         })
 
         :telemetry.execute(
@@ -817,7 +868,9 @@ defmodule FireBird.Executor do
           payment_hash: payment.payment_hash,
           amount_sats: payment.amount_sats,
           reason: reason_str,
-          attempts: exhausted.attempt
+          attempts: exhausted.attempt,
+          external_id: payment.external_id,
+          generation: payment_generation(payment)
         })
 
         :telemetry.execute(
@@ -848,7 +901,9 @@ defmodule FireBird.Executor do
           payment_hash: payment.payment_hash,
           amount_sats: payment.amount_sats,
           reason: reason_str,
-          attempts: failed.attempt
+          attempts: failed.attempt,
+          external_id: payment.external_id,
+          generation: payment_generation(payment)
         })
 
         :telemetry.execute(
@@ -877,7 +932,9 @@ defmodule FireBird.Executor do
           amount_sats: payment.amount_sats,
           reason: reason_str,
           attempt: unknown.attempt,
-          phoenixd_id: unknown.phoenixd_id
+          phoenixd_id: unknown.phoenixd_id,
+          external_id: payment.external_id,
+          generation: payment_generation(payment)
         })
 
         Logger.error(
@@ -920,7 +977,10 @@ defmodule FireBird.Executor do
           payment_hash: payment.payment_hash,
           amount_sats: payment.amount_sats,
           fee_sats: fee_sats,
-          preimage: preimage
+          preimage: preimage,
+          external_id: payment.external_id,
+          generation: payment_generation(payment),
+          description: payment.description
         })
 
         :telemetry.execute(
@@ -929,7 +989,7 @@ defmodule FireBird.Executor do
           %{amount_sats: payment.amount_sats}
         )
 
-        state
+        %{state | succeeded_hashes: Map.put(state.succeeded_hashes, payment.payment_hash, true)}
 
       {:error, :invalid_preimage} ->
         # phoenixd returned a "success" whose preimage does not
@@ -941,6 +1001,33 @@ defmodule FireBird.Executor do
       {:error, _reason} ->
         state
     end
+  end
+
+  defp publish_terminal_payment(pubsub, %Payment{status: :succeeded} = payment) do
+    PubSub.publish(pubsub, :payment, %PaymentSent{
+      payment_hash: payment.payment_hash,
+      amount_sats: payment.amount_sats,
+      fee_sats: payment.fee_sats || 0,
+      preimage: payment.preimage,
+      external_id: payment.external_id,
+      generation: payment_generation(payment),
+      description: payment.description
+    })
+  end
+
+  defp publish_terminal_payment(pubsub, %Payment{} = payment) do
+    PubSub.publish(pubsub, :payment, %PaymentExhausted{
+      payment_hash: payment.payment_hash,
+      amount_sats: payment.amount_sats,
+      reason: payment.last_error || "terminal_payment_replay",
+      attempts: payment.attempt,
+      external_id: payment.external_id,
+      generation: payment_generation(payment)
+    })
+  end
+
+  defp payment_generation(%Payment{} = payment) do
+    "#{payment.external_id || ""}:#{DateTime.to_iso8601(payment.created_at)}"
   end
 
   defp cleanup_terminal(state) do
@@ -988,4 +1075,7 @@ defmodule FireBird.Executor do
   end
 
   defp schedule_cleanup(interval), do: Process.send_after(self(), :cleanup, interval)
+
+  defp schedule_terminal_replay(interval),
+    do: Process.send_after(self(), :replay_terminal, interval)
 end

@@ -65,4 +65,41 @@ defmodule FireBird.Classifier do
   end
 
   def classify(_other), do: :connection_ambiguous
+
+  @doc "Returns true only for an explicit invalid or expired invoice non-attempt."
+  @spec invalid_invoice?(term()) :: boolean()
+  def invalid_invoice?(body) when is_map(body) do
+    body
+    |> Map.take(["error", "message", "reason", "detail"])
+    |> Map.values()
+    |> Enum.any?(&invalid_invoice?/1)
+  end
+
+  def invalid_invoice?(body) when is_binary(body) do
+    text = String.downcase(body)
+
+    Enum.any?(
+      [
+        "invalid invoice",
+        "invoice is invalid",
+        "invoice invalid",
+        "malformed invoice",
+        "invoice malformed",
+        "expired invoice",
+        "invoice expired",
+        "invoice has expired",
+        "invoice is expired",
+        "payment request expired",
+        "invoice expiry",
+        "unsupported network",
+        "wrong network",
+        "invalid bech32",
+        "invalid checksum",
+        "invalid signature"
+      ],
+      &String.contains?(text, &1)
+    )
+  end
+
+  def invalid_invoice?(_body), do: false
 end

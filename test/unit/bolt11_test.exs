@@ -1,6 +1,8 @@
 defmodule FireBird.Bolt11Test do
   use ExUnit.Case, async: true
 
+  import Bitwise
+
   alias FireBird.Bolt11
 
   describe "parse_amount/1" do
@@ -157,6 +159,66 @@ defmodule FireBird.Bolt11Test do
     end
   end
 
+  describe "validate/2" do
+    @valid_now ~U[2017-06-01 10:00:00Z]
+
+    test "accepts the canonical checksummed and signed invoice" do
+      assert {:ok, invoice} = Bolt11.validate(@spec_invoice, now: @valid_now)
+      assert invoice.amount_sats == 250_000
+      assert invoice.payment_hash == @spec_hash
+      assert invoice.network == :mainnet
+      assert invoice.expiry_seconds == 60
+    end
+
+    test "accepts an all-uppercase invoice using the lowercase signed payload" do
+      assert {:ok, invoice} = Bolt11.validate(String.upcase(@spec_invoice), now: @valid_now)
+      assert invoice.payment_hash == @spec_hash
+    end
+
+    test "rejects an unknown prefix before payload parsing" do
+      assert {:error, :invalid_prefix} = Bolt11.validate("not-a-bolt11", now: @valid_now)
+    end
+
+    test "rejects a wrong network before signature or expiry handling" do
+      assert {:error, :wrong_network} =
+               Bolt11.validate(@spec_invoice, network: :testnet, now: @valid_now)
+    end
+
+    test "rejects expiry and the submission safety window" do
+      assert {:error, :expired} = Bolt11.validate(@spec_invoice, now: ~U[2017-06-01 10:58:38Z])
+
+      assert {:error, :expiring_too_soon} =
+               Bolt11.validate(@spec_invoice, now: ~U[2017-06-01 10:58:20Z])
+    end
+
+    test "rejects an invalid checksum" do
+      invalid = String.slice(@spec_invoice, 0, byte_size(@spec_invoice) - 1) <> "q"
+      assert {:error, :invalid_checksum} = Bolt11.validate(invalid, now: @valid_now)
+    end
+
+    test "rejects a mixed-case invoice" do
+      invalid = String.replace_prefix(@spec_invoice, "lnbc", "lnBc")
+      assert {:error, :mixed_case} = Bolt11.validate(invalid, now: @valid_now)
+    end
+
+    test "rejects an invalid signature even with a valid replacement checksum" do
+      words = invoice_words(@spec_invoice)
+      signature_index = length(words) - 6 - 104
+      mutated = List.update_at(words, signature_index, &Bitwise.bxor(&1, 1))
+      invalid = encode_invoice(@spec_invoice, mutated)
+      assert {:error, :invalid_signature} = Bolt11.validate(invalid, now: @valid_now)
+    end
+
+    test "rejects duplicate singleton tags before signature verification" do
+      words = Enum.drop(invoice_words(@spec_invoice), -6)
+      {timestamp, rest} = Enum.split(words, 7)
+      {payment_tag, remaining} = Enum.split(rest, 55)
+      mutated = timestamp ++ payment_tag ++ payment_tag ++ remaining ++ [0, 0, 0, 0, 0, 0]
+      invalid = encode_invoice(@spec_invoice, mutated)
+      assert {:error, {:duplicate_tag, 1}} = Bolt11.validate(invalid, now: @valid_now)
+    end
+  end
+
   # --- Synthetic invoice builder (test support) ---
   #
   # Emits amount + payment_hash tag + description_hash tag + filler
@@ -197,6 +259,45 @@ defmodule FireBird.Bolt11Test do
     pad_bits = output_chars * 5 - bit_size(binary)
     padded = <<binary::bitstring, 0::size(pad_bits)>>
     for <<v::size(5) <- padded>>, into: "", do: <<char(v)>>
+  end
+
+  defp invoice_words(invoice) do
+    separator = invoice |> :binary.matches("1") |> List.last() |> elem(0)
+    data = binary_part(invoice, separator + 1, byte_size(invoice) - separator - 1)
+
+    data
+    |> String.to_charlist()
+    |> Enum.map(&Enum.find_index(@bech32_alphabet, fn char -> char == &1 end))
+  end
+
+  defp encode_invoice(original, words) do
+    separator = original |> :binary.matches("1") |> List.last() |> elem(0)
+    hrp = binary_part(original, 0, separator)
+    data = Enum.drop(words, -6)
+    checksum = invoice_checksum(hrp, data)
+    hrp <> "1" <> Enum.map_join(data ++ checksum, &<<char(&1)>>)
+  end
+
+  defp invoice_checksum(hrp, data) do
+    chars = String.to_charlist(hrp)
+    expanded = Enum.map(chars, &(&1 >>> 5)) ++ [0] ++ Enum.map(chars, &Bitwise.band(&1, 31))
+    polymod = Bitwise.bxor(1, invoice_polymod(expanded ++ data ++ [0, 0, 0, 0, 0, 0]))
+    for index <- 0..5, do: Bitwise.band(polymod >>> (5 * (5 - index)), 31)
+  end
+
+  defp invoice_polymod(values) do
+    generators = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+
+    Enum.reduce(values, 1, fn value, checksum ->
+      top = checksum >>> 25
+      shifted = Bitwise.bxor(Bitwise.band(checksum, 0x1FFFFFF) <<< 5, value)
+
+      generators
+      |> Enum.with_index()
+      |> Enum.reduce(shifted, fn {generator, index}, acc ->
+        if Bitwise.band(top >>> index, 1) == 1, do: Bitwise.bxor(acc, generator), else: acc
+      end)
+    end)
   end
 
   defp char(index) when index in 0..31, do: Enum.at(@bech32_alphabet, index)

@@ -158,7 +158,18 @@ Payment.next_retry_delay(failed)  # 1_000 (ms, doubles each attempt)
 # via Client.get_outgoing_payment_by_hash/2.
 ```
 
-### BOLT11 Amount Parsing
+Every outbound outcome carries the immutable `external_id` and a payment
+`generation` derived from the existing WAL-persisted `external_id` and
+`created_at`. Consumers must reconcile that attempt, not whichever attempt
+currently occupies a payment-hash row. WAL recovery restores the latest
+terminal rows and periodically republishes them. A separate succeeded-hash
+set is rebuilt from all successful WAL entries and survives terminal-record
+retention cleanup and executor restarts. Retry-time WAL failure produces an
+identity-correct `PaymentUnknown` instead of a timerless retrying row.
+`{:error, {:ambiguous_write, reason}}` is propagated without dispatch or
+compensation; only definitive pre-write failures use `:wal_unavailable`.
+
+### BOLT11 Parsing and Validation
 
 ```elixir
 alias FireBird.Bolt11
@@ -167,7 +178,21 @@ alias FireBird.Bolt11
 {:ok, 10_000}  = Bolt11.parse_amount("lnbc100u1p...")     # microbitcoin
 {:ok, 150}     = Bolt11.parse_amount("lnbc1500n1p...")    # nanobitcoin
 {:ok, 1}       = Bolt11.parse_amount("lnbc10000p1p...")   # picobitcoin
+
+# Money submission uses the strict validator: Bech32 checksum, singleton
+# and required tagged structure, recoverable secp256k1 signature, network,
+# and expiry with a submission safety window.
+{:ok, invoice} =
+  Bolt11.validate(bolt11,
+    network: :mainnet,
+    now: DateTime.utc_now(),
+    safety_window_seconds: 30
+  )
 ```
+
+Explicit phoenixd invalid/expired-invoice responses are definitive
+non-attempts. Missing outgoing history and unrecognized errors remain
+ambiguous; a bare 404 never authorizes reservation release.
 
 ### Fee Calculation
 
