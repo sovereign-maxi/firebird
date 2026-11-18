@@ -286,13 +286,25 @@ defmodule FireBird.Executor do
 
     case :ets.lookup(state.table_name, payment_hash) do
       [{^payment_hash, %Payment{} = payment}] when payment.status == :retrying ->
-        case execute_payment(state, payment) do
-          {:ok, state} ->
-            {:noreply, state}
+        if map_size(state.tasks) >= state.max_concurrent do
+          timer_ref =
+            Process.send_after(
+              self(),
+              {:retry, payment.payment_hash},
+              Payment.next_retry_delay(payment)
+            )
 
-          {:error, _wal_reason, state} ->
-            in_flight = %{payment | status: :in_flight, attempt: payment.attempt + 1}
-            {:noreply, handle_unknown_outcome(state, in_flight, "wal_unavailable_on_retry")}
+          {:noreply,
+           %{state | retry_timers: Map.put(state.retry_timers, payment.payment_hash, timer_ref)}}
+        else
+          case execute_payment(state, payment) do
+            {:ok, state} ->
+              {:noreply, state}
+
+            {:error, _wal_reason, state} ->
+              in_flight = %{payment | status: :in_flight, attempt: payment.attempt + 1}
+              {:noreply, handle_unknown_outcome(state, in_flight, "wal_unavailable_on_retry")}
+          end
         end
 
       _other ->

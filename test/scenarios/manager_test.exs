@@ -409,6 +409,40 @@ defmodule FireBird.ManagerTest do
       assert {:ok, unchanged} = Manager.lookup(ctx.table, payment_hash)
       assert unchanged.status == :pending
     end
+
+    for received_sats <- [0, -1] do
+      test "receivedSat=#{received_sats} fails closed without crashing Manager", ctx do
+        received_sats = unquote(received_sats)
+        preimage = :crypto.strong_rand_bytes(32)
+        payment_hash = :crypto.hash(:sha256, preimage)
+        preimage_hex = Base.encode16(preimage, case: :lower)
+
+        invoice = build_test_invoice(payment_hash: payment_hash, amount_sats: 10_000)
+        Manager.track(ctx.pid, invoice)
+        Registry.register(ctx.pubsub, :invoice, [])
+
+        MockClient.set_response(
+          ctx.client,
+          :get_incoming_payment,
+          {:ok,
+           %{
+             "isPaid" => true,
+             "preimage" => preimage_hex,
+             "receivedSat" => received_sats
+           }}
+        )
+
+        for _poll <- 1..2 do
+          send(ctx.pid, :poll)
+          :sys.get_state(ctx.pid)
+          assert Process.alive?(ctx.pid)
+        end
+
+        refute_receive {FireBird.PubSub, :invoice, %FireBird.Events.InvoicePaid{}}
+        assert {:ok, unchanged} = Manager.lookup(ctx.table, payment_hash)
+        assert unchanged.status == :pending
+      end
+    end
   end
 
   describe "poll — preimage length validation" do

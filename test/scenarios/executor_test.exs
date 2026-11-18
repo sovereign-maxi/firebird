@@ -210,9 +210,15 @@ defmodule FireBird.ExecutorTest do
       assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentSent{}}, 5_000
     end
 
-    test "exhaustion publishes PaymentExhausted", ctx do
+    test "exhaustion publishes PaymentExhausted with attempt identity", ctx do
       Registry.register(ctx.pubsub, :payment, [])
-      payment = build_test_payment(max_attempts: 1)
+
+      payment =
+        build_test_payment(
+          max_attempts: 1,
+          external_id: "reservation:exhausted",
+          created_at: ~U[2026-01-01 00:00:00.000000Z]
+        )
 
       MockClient.set_response(
         ctx.client,
@@ -224,9 +230,147 @@ defmodule FireBird.ExecutorTest do
 
       assert_receive {FireBird.PubSub, :payment,
                       %FireBird.Events.PaymentExhausted{
-                        attempts: 1
+                        payment_hash: payment_hash,
+                        attempts: 1,
+                        external_id: "reservation:exhausted",
+                        generation: generation
                       }},
                      1_000
+
+      assert payment_hash == payment.payment_hash
+      assert generation == "reservation:exhausted:2026-01-01T00:00:00.000000Z"
+    end
+
+    test "scheduled retry waits for capacity and remains scheduled" do
+      n = System.unique_integer([:positive])
+      table = :"retry_capacity_#{n}"
+      pubsub = :"retry_capacity_pubsub_#{n}"
+      client_name = :"retry_capacity_client_#{n}"
+
+      start_supervised!({Registry, keys: :duplicate, name: pubsub}, id: pubsub)
+      start_supervised!({MockClient, name: client_name}, id: client_name)
+
+      pid =
+        start_supervised!(
+          {Executor,
+           [
+             client: {MockClient, client_name},
+             pubsub: pubsub,
+             table_name: table,
+             max_concurrent: 1,
+             name: :"retry_capacity_srv_#{n}"
+           ]},
+          id: {Executor, n}
+        )
+
+      test_pid = self()
+      preimage_hex = Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
+      call_count = :counters.new(1, [:atomics])
+
+      MockClient.set_response(client_name, :pay_invoice, fn ->
+        count = :counters.get(call_count, 1)
+        :counters.add(call_count, 1, 1)
+
+        if count == 0 do
+          send(test_pid, {:blocker_started, self()})
+
+          receive do
+            :release_blocker -> :ok
+          end
+        else
+          send(test_pid, :retry_started)
+        end
+
+        {:ok, %{"preimage" => preimage_hex, "fees" => 0}}
+      end)
+
+      retry = build_test_payment(external_id: "reservation:retry-capacity")
+      :ets.insert(table, {retry.payment_hash, %{retry | status: :retrying, attempt: 1}})
+      blocker = build_test_payment()
+
+      assert :ok = Executor.submit(pid, blocker)
+      assert_receive {:blocker_started, blocker_pid}, 1_000
+
+      send(pid, {:retry, retry.payment_hash})
+      state = :sys.get_state(pid)
+
+      assert length(MockClient.calls(client_name, :pay_invoice)) == 1
+      assert Map.has_key?(state.retry_timers, retry.payment_hash)
+      assert {:ok, %{status: :retrying, attempt: 1}} = Executor.lookup(table, retry.payment_hash)
+      refute_receive :retry_started, 100
+
+      send(blocker_pid, :release_blocker)
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :succeeded}}, Executor.lookup(table, blocker.payment_hash))
+      end)
+
+      send(pid, {:retry, retry.payment_hash})
+      assert_receive :retry_started, 1_000
+
+      FireBirdHelpers.await_condition(fn ->
+        match?({:ok, %{status: :succeeded}}, Executor.lookup(table, retry.payment_hash))
+      end)
+
+      assert length(MockClient.calls(client_name, :pay_invoice)) == 2
+    end
+  end
+
+  describe "terminal payment identity and resubmission" do
+    test "accepts a new generation after definitive failure", ctx do
+      Registry.register(ctx.pubsub, :payment, [])
+      created_at = ~U[2026-01-01 00:00:00.000000Z]
+
+      payment =
+        build_test_payment(
+          max_attempts: 1,
+          external_id: "reservation:new-generation",
+          created_at: created_at
+        )
+
+      preimage_hex = Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
+      call_count = :counters.new(1, [:atomics])
+
+      MockClient.set_response(ctx.client, :pay_invoice, fn ->
+        count = :counters.get(call_count, 1)
+        :counters.add(call_count, 1, 1)
+
+        if count == 0 do
+          {:error, {:phoenixd_error, :route_not_found, "no route"}}
+        else
+          {:ok, %{"preimage" => preimage_hex, "fees" => 0}}
+        end
+      end)
+
+      assert :ok = Executor.submit(ctx.pid, payment)
+
+      assert_receive {FireBird.PubSub, :payment,
+                      %FireBird.Events.PaymentExhausted{
+                        generation: "reservation:new-generation:2026-01-01T00:00:00.000000Z"
+                      }},
+                     1_000
+
+      new_generation =
+        Payment.new(
+          payment_hash: payment.payment_hash,
+          bolt11: payment.bolt11,
+          amount_sats: payment.amount_sats,
+          created_at: DateTime.add(created_at, 60, :second),
+          external_id: payment.external_id,
+          max_attempts: 1
+        )
+
+      assert :ok = Executor.submit(ctx.pid, new_generation)
+
+      assert_receive {FireBird.PubSub, :payment,
+                      %FireBird.Events.PaymentSent{
+                        payment_hash: payment_hash,
+                        external_id: "reservation:new-generation",
+                        generation: "reservation:new-generation:2026-01-01T00:01:00.000000Z"
+                      }},
+                     1_000
+
+      assert payment_hash == payment.payment_hash
     end
   end
 
@@ -339,15 +483,29 @@ defmodule FireBird.ExecutorTest do
   end
 
   describe "unknown-outcome errors (fail-closed)" do
-    test "HTTP timeout publishes PaymentUnknown, NOT PaymentFailed/Exhausted", ctx do
+    test "HTTP timeout publishes PaymentUnknown with attempt identity, NOT failure", ctx do
       Registry.register(ctx.pubsub, :payment, [])
-      payment = build_test_payment(max_attempts: 3)
+
+      payment =
+        build_test_payment(
+          max_attempts: 3,
+          external_id: "reservation:unknown",
+          created_at: ~U[2026-01-01 00:00:00.000000Z]
+        )
 
       MockClient.set_response(ctx.client, :pay_invoice, {:error, :timeout})
 
       Executor.submit(ctx.pid, payment)
 
-      assert_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentUnknown{}}, 1_000
+      assert_receive {FireBird.PubSub, :payment,
+                      %FireBird.Events.PaymentUnknown{
+                        payment_hash: payment_hash,
+                        external_id: "reservation:unknown",
+                        generation: "reservation:unknown:2026-01-01T00:00:00.000000Z"
+                      }},
+                     1_000
+
+      assert payment_hash == payment.payment_hash
       refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentFailed{}}, 200
       refute_receive {FireBird.PubSub, :payment, %FireBird.Events.PaymentExhausted{}}, 200
     end

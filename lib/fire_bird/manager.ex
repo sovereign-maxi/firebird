@@ -245,6 +245,13 @@ defmodule FireBird.Manager do
 
         confirm_payment(state, invoice, preimage_hex, received)
 
+      {:ok, received} when received <= 0 ->
+        Logger.error(
+          "Manager: non-positive receivedSat for " <>
+            "#{Base.encode16(invoice.payment_hash, case: :lower)} — " <>
+            "received #{received} sats; refusing to confirm (fail-closed)"
+        )
+
       :unknown ->
         # `receivedSat` absent from phoenixd response. Fail closed —
         # crediting the invoice at the expected amount without proof
