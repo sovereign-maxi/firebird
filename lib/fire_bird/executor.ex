@@ -39,8 +39,6 @@ defmodule FireBird.Executor do
     :retention_ms,
     :cleanup_interval,
     :cleanup_timer_ref,
-    :terminal_replay_interval,
-    :terminal_replay_timer_ref,
     tasks: %{},
     retry_timers: %{},
     succeeded_hashes: %{}
@@ -49,7 +47,6 @@ defmodule FireBird.Executor do
   @default_max_concurrent 10
   @default_retention_ms 86_400_000
   @default_cleanup_interval 3_600_000
-  @default_terminal_replay_interval 30_000
 
   # Non-terminal statuses in which a duplicate submit is rejected —
   # accepting one would spawn a second `pay_invoice` task for the
@@ -98,6 +95,10 @@ defmodule FireBird.Executor do
     end
   end
 
+  @doc "Republishes retained terminal payments after a consumer subscription recovery."
+  @spec replay_terminal(GenServer.server()) :: :ok
+  def replay_terminal(server \\ __MODULE__), do: GenServer.cast(server, :replay_terminal)
+
   @doc """
   Node-side reconciliation query for a payment hash — asks phoenixd
   directly via `get_outgoing_payment_by_hash/2`. Returns one of:
@@ -141,9 +142,6 @@ defmodule FireBird.Executor do
     retention_ms = Keyword.get(opts, :retention_ms, @default_retention_ms)
     cleanup_interval = Keyword.get(opts, :cleanup_interval, @default_cleanup_interval)
 
-    terminal_replay_interval =
-      Keyword.get(opts, :terminal_replay_interval, @default_terminal_replay_interval)
-
     if is_nil(wal) do
       Logger.warning(
         "Executor: started without WAL — " <>
@@ -165,20 +163,11 @@ defmodule FireBird.Executor do
       liquidity_table: liquidity_table,
       retention_ms: retention_ms,
       cleanup_interval: cleanup_interval,
-      terminal_replay_interval: terminal_replay_interval,
       retry_timers: recovered_timers,
       succeeded_hashes: succeeded_hashes
     }
 
-    cleanup_timer_ref = schedule_cleanup(cleanup_interval)
-    terminal_replay_timer_ref = schedule_terminal_replay(terminal_replay_interval)
-
-    {:ok,
-     %{
-       state
-       | cleanup_timer_ref: cleanup_timer_ref,
-         terminal_replay_timer_ref: terminal_replay_timer_ref
-     }}
+    {:ok, %{state | cleanup_timer_ref: schedule_cleanup(cleanup_interval)}}
   end
 
   @impl GenServer
@@ -312,19 +301,6 @@ defmodule FireBird.Executor do
     end
   end
 
-  def handle_info(:replay_terminal, state) do
-    state.table_name
-    |> :ets.tab2list()
-    |> Enum.each(fn {_hash, payment} ->
-      if payment.status in [:succeeded, :failed, :exhausted] do
-        publish_terminal_payment(state.pubsub, payment)
-      end
-    end)
-
-    timer_ref = schedule_terminal_replay(state.terminal_replay_interval)
-    {:noreply, %{state | terminal_replay_timer_ref: timer_ref}}
-  end
-
   def handle_info(:cleanup, state) do
     deleted = cleanup_terminal(state)
 
@@ -346,9 +322,21 @@ defmodule FireBird.Executor do
   end
 
   @impl GenServer
+  def handle_cast(:replay_terminal, state) do
+    state.table_name
+    |> :ets.tab2list()
+    |> Enum.each(fn {_hash, payment} ->
+      if payment.status in [:succeeded, :failed, :exhausted] do
+        publish_terminal_payment(state.pubsub, payment)
+      end
+    end)
+
+    {:noreply, state}
+  end
+
+  @impl GenServer
   def terminate(_reason, state) do
     if state.cleanup_timer_ref, do: Process.cancel_timer(state.cleanup_timer_ref)
-    if state.terminal_replay_timer_ref, do: Process.cancel_timer(state.terminal_replay_timer_ref)
     Enum.each(state.retry_timers, fn {_hash, ref} -> Process.cancel_timer(ref) end)
 
     case state.wal do
@@ -1087,7 +1075,4 @@ defmodule FireBird.Executor do
   end
 
   defp schedule_cleanup(interval), do: Process.send_after(self(), :cleanup, interval)
-
-  defp schedule_terminal_replay(interval),
-    do: Process.send_after(self(), :replay_terminal, interval)
 end

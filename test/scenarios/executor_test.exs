@@ -1350,7 +1350,7 @@ defmodule FireBird.ExecutorTest do
       assert {:error, {:duplicate, {:already_terminal, :succeeded}}} =
                Executor.submit(pid, resolved)
 
-      send(pid, :replay_terminal)
+      :ok = Executor.replay_terminal(pid)
 
       assert_receive {FireBird.PubSub, :payment,
                       %FireBird.Events.PaymentSent{external_id: "reservation:recovered"}},
